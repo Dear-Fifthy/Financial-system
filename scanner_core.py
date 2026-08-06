@@ -29,7 +29,7 @@ def get_ocr() -> PaddleOCRVL:
         use_ocr_for_image_block=True,
         format_block_content=True,
         merge_layout_blocks=True,
-        use_queues=True,
+        use_queues=False,
     )
 
 
