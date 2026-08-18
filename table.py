@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import sys
@@ -122,7 +122,9 @@ class LoginRegisterDialog(QDialog):
 @dataclass
 class TaskRecord:
     file_path: Path
-    output_paths: list[Path]
+    category: str = ""
+    hub_json_path: Path | None = None
+    cache_json_paths: list[Path] = field(default_factory=list)
     status: str = "等待中"
 
 
@@ -133,22 +135,25 @@ class ScanWorker(QObject):
     task_failed = Signal(str, str)
     finished = Signal()
 
-    def __init__(self, file_path: Path) -> None:
+    def __init__(self, file_path: Path, current_user: dict) -> None:
         super().__init__()
         self._file_path = file_path
+        self._current_user = current_user
 
     @Slot()
     def run(self) -> None:
         try:
-            from scanner_core import OUTPUT_DIR, process_file
+            from hub_pipeline import process_file_to_hub
 
             self.task_started.emit(str(self._file_path))
             self.log_message.emit(f"开始处理：{self._file_path}")
 
-            output_paths = process_file(self._file_path, OUTPUT_DIR)
+            result = process_file_to_hub(self._file_path, current_user=self._current_user)
 
-            self.task_finished.emit(str(self._file_path), output_paths)
-            self.log_message.emit(f"完成处理：{self._file_path}")
+            self.task_finished.emit(str(self._file_path), result)
+            self.log_message.emit(
+                f"完成处理：{self._file_path} | 分类：{result['category']}"
+            )
         except Exception as exc:
             self.task_failed.emit(str(self._file_path), f"{type(exc).__name__}: {exc}")
             self.log_message.emit(f"处理失败：{self._file_path} | {type(exc).__name__}: {exc}")
@@ -290,7 +295,7 @@ class MainWindow(QMainWindow):
             if normalized in self._records:
                 continue
 
-            record = TaskRecord(file_path=normalized, output_paths=[])
+            record = TaskRecord(file_path=normalized)
             self._records[normalized] = record
 
             item = QListWidgetItem(f"{normalized.name}  [{record.status}]")
@@ -315,9 +320,10 @@ class MainWindow(QMainWindow):
             self._add_paths([Path(name) for name in file_names])
 
     def _open_output_directory(self) -> None:
-        from scanner_core import OUTPUT_DIR
+        from hub_pipeline import HUB_DIR
 
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(OUTPUT_DIR)))
+        HUB_DIR.mkdir(exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(HUB_DIR)))
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -340,7 +346,7 @@ class MainWindow(QMainWindow):
         self._update_item(file_path)
 
         thread = QThread(self)
-        worker = ScanWorker(file_path)
+        worker = ScanWorker(file_path, current_user=self.current_user)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -361,26 +367,32 @@ class MainWindow(QMainWindow):
     def _on_task_started(self, file_path_text: str) -> None:
         self._append_log(f"开始：{file_path_text}")
 
-    def _on_task_finished(self, file_path_text: str, output_paths: object) -> None:
+    def _on_task_finished(self, file_path_text: str, result: object) -> None:
         file_path = Path(file_path_text)
         record = self._records.get(file_path)
         if record is None:
             return
 
-        if isinstance(output_paths, list):
-            record.output_paths = [Path(path) for path in output_paths]
-        record.status = "已完成"
-        self._update_item(file_path)
-        self._append_log(f"输出：{', '.join(str(path) for path in record.output_paths)}")
+        if isinstance(result, dict):
+            record.category = result.get("category", "")
+            record.hub_json_path = result.get("hub_json_path")
+            record.cache_json_paths = result.get("cache_json_paths", [])
 
-        # 核心逻辑联动：AI 识别完成后自动解析并存入 PostgreSQL 数据库
-        if record.output_paths:
+        record.status = f"已完成 [{record.category}]" if record.category else "已完成"
+        self._update_item(file_path)
+        self._append_log(f"分类：{record.category} | Hub 输出：{record.hub_json_path}")
+
+        # 核心逻辑联动：只有分类为"合同"、且已经提取出台账字段时，才自动写入
+        # contract_projects 台账。合同编号/合同金额目前还是占位值，等第5步
+        # 接上外部 AI API 解析之后，应该用解析结果覆盖这行（同一个合同编号
+        # ON CONFLICT 会自动更新，不会产生重复行）。
+        contract_fields = result.get("contract_fields") if isinstance(result, dict) else None
+        if contract_fields:
             try:
-                payload = json.loads(record.output_paths[0].read_text(encoding="utf-8"))
-                ok, msg = api_save_contract_from_ai(payload)
-                self._append_log(f"数据库同步状态: {msg}")
+                ok, msg = api_save_contract_from_ai(contract_fields)
+                self._append_log(f"合同台账同步状态: {msg}")
             except Exception as exc:
-                self._append_log(f"数据自动解析入库失败: {exc}")
+                self._append_log(f"合同台账写入失败: {exc}")
 
         self._load_preview_for_path(file_path)
 
@@ -418,9 +430,9 @@ class MainWindow(QMainWindow):
         if record is None:
             return
 
-        if record.output_paths:
+        if record.hub_json_path is not None:
             try:
-                payload = json.loads(record.output_paths[0].read_text(encoding="utf-8"))
+                payload = json.loads(Path(record.hub_json_path).read_text(encoding="utf-8"))
                 self.preview.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
             except Exception as exc:
                 self.preview.setPlainText(f"无法读取预览：{exc}")

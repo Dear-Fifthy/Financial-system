@@ -4,3 +4,5 @@ __pycache__/
 input/
 output/
 .env
+hub/
+hub_encryption.key

@@ -128,18 +128,23 @@ def authenticate_user(username: str, password: str) -> tuple[bool, dict | str]:
 
 # ===== 2. AI 识别合同数据写入 API =====
 def api_save_contract_from_ai(ai_parsed_json: dict) -> tuple[bool, str]:
-    """将 AI 提取的合同 JSON 数据存入数据库。"""
+    """将 AI 提取的合同 JSON 数据存入数据库。
+
+    ai_parsed_json 的 key 仍然用英文（contract_code/contract_term/party_a/
+    income/is_paid），只是内部 Python 变量名方便维护；实际写入数据库的
+    列名（台账栏目）已经是中文，财务人员直接查表/导出时看到的就是中文。
+    """
     try:
         with get_connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO contract_projects (contract_code, contract_term, party_a, income, is_paid)
+                INSERT INTO contract_projects ("合同编号", "合同期限", "甲方", "合同金额", "是否已收款")
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (contract_code) DO UPDATE 
-                SET contract_term = EXCLUDED.contract_term,
-                    party_a = EXCLUDED.party_a,
-                    income = EXCLUDED.income,
-                    is_paid = EXCLUDED.is_paid;
+                ON CONFLICT ("合同编号") DO UPDATE
+                SET "合同期限" = EXCLUDED."合同期限",
+                    "甲方" = EXCLUDED."甲方",
+                    "合同金额" = EXCLUDED."合同金额",
+                    "是否已收款" = EXCLUDED."是否已收款";
             """,
                 (
                     ai_parsed_json.get("contract_code"),
@@ -156,17 +161,29 @@ def api_save_contract_from_ai(ai_parsed_json: dict) -> tuple[bool, str]:
 
 
 # ===== 3. 动态表结构调整 API (手动/AI 习惯模式) =====
+# 允许通过 api_alter_table_field 新增的字段类型白名单，避免 col_type 被
+# 拼进 SQL 时夹带任意内容（这是之前 Part 2 提到的那个口子，顺手堵上）。
+ALLOWED_COLUMN_TYPES = {
+    "VARCHAR(50)", "VARCHAR(100)", "VARCHAR(200)", "VARCHAR(255)",
+    "TEXT", "NUMERIC(15,2)", "BOOLEAN", "DATE", "TIMESTAMP", "INTEGER",
+}
+
+
 def api_alter_table_field(action_type: str, col_name: str, col_type: str = "VARCHAR(255)") -> tuple[bool, str]:
-    """修改表字段（新增/删除列）。"""
-    if not re.match(r"^[a-zA-Z0-9_]+$", col_name):
-        return False, "字段名只能包含英文字母、数字和下划线！"
+    """修改表字段（新增/删除列）。字段名支持中英文+数字+下划线，
+    跟新的中文台账栏目风格保持一致。"""
+    if not re.match(r"^[\w\u4e00-\u9fa5]+$", col_name):
+        return False, "字段名只能包含中英文、数字和下划线！"
 
     try:
         with get_connection() as conn, conn.cursor() as cur:
+            quoted_col = f'"{col_name}"'
             if action_type.upper() == "ADD":
-                sql = f"ALTER TABLE contract_projects ADD COLUMN {col_name} {col_type};"
+                if col_type.upper() not in ALLOWED_COLUMN_TYPES:
+                    return False, f"不支持的字段类型：{col_type}（仅支持：{', '.join(sorted(ALLOWED_COLUMN_TYPES))}）"
+                sql = f"ALTER TABLE contract_projects ADD COLUMN {quoted_col} {col_type};"
             elif action_type.upper() == "DROP":
-                sql = f"ALTER TABLE contract_projects DROP COLUMN {col_name};"
+                sql = f"ALTER TABLE contract_projects DROP COLUMN {quoted_col};"
             else:
                 return False, "未知的修改类型！"
 
@@ -183,6 +200,6 @@ def api_ai_analyze_user_habits() -> dict:
     return {
         "reason": "检测到近 10 份扫描文本中均包含【发票开具状态】",
         "action": "ADD",
-        "col_name": "invoice_status",
+        "col_name": "发票状态",
         "col_type": "VARCHAR(50)",
     }
