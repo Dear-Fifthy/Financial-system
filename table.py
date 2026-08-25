@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 import traceback
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QEventLoop, QObject, QThread, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -30,8 +31,12 @@ from PySide6.QtWidgets import (
 
 # 引入数据库与 API 服务层
 from database_serv import (
+    ALLOWED_COLUMN_TYPES,
+    ALLOWED_TABLES,
     api_ai_analyze_user_habits,
     api_alter_table_field,
+    api_get_table_fields,
+    api_rename_table_field,
     api_save_contract_from_ai,
     authenticate_user,
     register_user,
@@ -117,6 +122,187 @@ class LoginRegisterDialog(QDialog):
                 self.accept()
             else:
                 QMessageBox.critical(self, "登录失败", str(res))
+
+
+# ===== 字段调整对话框（读取/调整权限分离）=====
+class FieldAdjustDialog(QDialog):
+    """字段调整对话框。
+
+    展示指定业务表的全部字段（名称+类型），支持：
+      - 新增字段（名称 + 白名单类型）
+      - 重命名选中字段
+      - 删除选中字段
+    所有变更先收集到 self._ops，点「确定」后按顺序提交给 database_serv
+    （权限：field:write，仅 financial_role / admin）。
+
+    业务扩展说明：以后新增其它业务表（发票/物流等）时，只需把表名登记进
+    database_serv.ALLOWED_TABLES，本对话框即可复用，互不影响。
+    ⚠️ 建议只调整用户扩展的自定义字段；内置字段（合同编号/甲方等）重命名
+    会导致入库 SQL 失效（见 api_rename_table_field 注释）。
+    """
+
+    def __init__(self, parent, current_user: dict, table_name: str) -> None:
+        super().__init__(parent)
+        self.current_user = current_user
+        self.table_name = table_name
+        self._fields: list[dict] = []   # 当前字段工作副本（随操作实时变化）
+        self._ops: list[tuple] = []     # 待提交操作列表：(ACTION, *args)
+        self.setWindowTitle(f"调整字段 - {table_name}")
+        self.resize(620, 460)
+        self._build_ui()
+        self._load_fields()
+
+    def _build_ui(self) -> None:
+        """构建对话框界面：字段列表 + 操作按钮 + 变更预览 + 确定/取消。"""
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("当前字段列表（可选中后重命名/删除）："))
+
+        self.field_list = QListWidget()
+        self.field_list.itemDoubleClicked.connect(self._rename_selected)
+        layout.addWidget(self.field_list, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_add = QPushButton("新增字段")
+        self.btn_add.clicked.connect(self._add_field)
+        self.btn_rename = QPushButton("重命名选中")
+        self.btn_rename.clicked.connect(self._rename_selected)
+        self.btn_delete = QPushButton("删除选中")
+        self.btn_delete.clicked.connect(self._delete_selected)
+        btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_rename)
+        btn_row.addWidget(self.btn_delete)
+        layout.addLayout(btn_row)
+
+        layout.addWidget(QLabel("变更预览："))
+        self.op_view = QPlainTextEdit()
+        self.op_view.setReadOnly(True)
+        self.op_view.setMaximumHeight(100)
+        layout.addWidget(self.op_view)
+
+        btn_confirm_row = QHBoxLayout()
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.clicked.connect(self._apply_changes)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_confirm_row.addStretch(1)
+        btn_confirm_row.addWidget(self.btn_ok)
+        btn_confirm_row.addWidget(self.btn_cancel)
+        layout.addLayout(btn_confirm_row)
+
+    def _load_fields(self) -> None:
+        """读取当前业务表的全部字段（仅元数据，不含数据内容）。"""
+        ok, res = api_get_table_fields(self.current_user, self.table_name)
+        if not ok:
+            QMessageBox.critical(self, "读取字段失败", str(res))
+            self._fields = []
+        else:
+            self._fields = list(res)
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        """按工作副本重建字段列表，并刷新变更预览。"""
+        self.field_list.clear()
+        for f in self._fields:
+            self.field_list.addItem(f"{f['column_name']}  ({f['data_type']})")
+        self._refresh_ops()
+
+    def _refresh_ops(self) -> None:
+        """把待提交操作渲染成可读的变更预览文本。"""
+        lines = [self._fmt_op(op) for op in self._ops]
+        self.op_view.setPlainText("\n".join(lines) if lines else "（暂无变更）")
+
+    @staticmethod
+    def _fmt_op(op: tuple) -> str:
+        """把一条操作元组格式化为预览文本。"""
+        if op[0] == "ADD":
+            return f"＋ 新增字段：{op[1]}  ({op[2]})"
+        if op[0] == "RENAME":
+            return f"⇄ 重命名：{op[1]}  →  {op[2]}"
+        if op[0] == "DROP":
+            return f"－ 删除字段：{op[1]}"
+        return str(op)
+
+    def _selected_field_name(self) -> str | None:
+        """返回列表当前选中项对应的字段名；未选中返回 None。"""
+        item = self.field_list.currentItem()
+        if item is None:
+            return None
+        return item.text().split("  (")[0]
+
+    def _add_field(self) -> None:
+        """新增字段：输入名称并从类型白名单中选择类型，加入待提交操作。"""
+        name, ok1 = QInputDialog.getText(self, "新增字段", "字段名（中英文、数字、下划线）：")
+        if not (ok1 and name.strip()):
+            return
+        name = name.strip()
+        if any(f["column_name"] == name for f in self._fields):
+            QMessageBox.warning(self, "重复", f"字段「{name}」已存在！")
+            return
+        col_type, ok2 = QInputDialog.getItem(
+            self, "新增字段", "字段类型：", sorted(ALLOWED_COLUMN_TYPES), 0, False
+        )
+        if not ok2:
+            return
+        self._fields.append({"column_name": name, "data_type": col_type})
+        self._ops.append(("ADD", name, col_type))
+        self._refresh_list()
+
+    def _rename_selected(self) -> None:
+        """重命名选中的字段（记录 RENAME 操作）。"""
+        old = self._selected_field_name()
+        if old is None:
+            QMessageBox.information(self, "提示", "请先选择一个字段。")
+            return
+        new, ok = QInputDialog.getText(self, "重命名字段", f"「{old}」的新名称：", text=old)
+        if not (ok and new.strip()):
+            return
+        new = new.strip()
+        if new == old:
+            return
+        if any(f["column_name"] == new for f in self._fields):
+            QMessageBox.warning(self, "重复", f"字段「{new}」已存在！")
+            return
+        for f in self._fields:
+            if f["column_name"] == old:
+                f["column_name"] = new
+                break
+        self._ops.append(("RENAME", old, new))
+        self._refresh_list()
+
+    def _delete_selected(self) -> None:
+        """删除选中的字段（记录 DROP 操作）。"""
+        old = self._selected_field_name()
+        if old is None:
+            QMessageBox.information(self, "提示", "请先选择一个字段。")
+            return
+        reply = QMessageBox.question(
+            self, "确认删除", f"确定删除字段「{old}」？该操作不可撤销。"
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._fields = [f for f in self._fields if f["column_name"] != old]
+        self._ops.append(("DROP", old))
+        self._refresh_list()
+
+    def _apply_changes(self) -> None:
+        """点「确定」：按顺序提交所有待执行操作，汇总结果显示后关闭对话框。"""
+        if not self._ops:
+            self.accept()
+            return
+        results: list[str] = []
+        for op in self._ops:
+            if op[0] == "ADD":
+                ok, msg = api_alter_table_field(self.current_user, "ADD", self.table_name, op[1], op[2])
+            elif op[0] == "RENAME":
+                ok, msg = api_rename_table_field(self.current_user, self.table_name, op[1], op[2])
+            elif op[0] == "DROP":
+                ok, msg = api_alter_table_field(self.current_user, "DROP", self.table_name, op[1])
+            else:
+                continue
+            results.append(("✅ " if ok else "❌ ") + msg)
+        QMessageBox.information(self, "调整结果", "\n".join(results))
+        self.accept()
 
 
 @dataclass
@@ -222,19 +408,38 @@ class MainWindow(QMainWindow):
         self.preview.setPlaceholderText("选择左侧任务后，这里显示输出 JSON。")
         right_layout.addWidget(self.preview, 2)
 
-        # 数据库扩展与 AI 控制区
+        # 数据库字段管理区：读取与调整权限分离（financial_role 拥有最高权限）
         db_control_frame = QFrame()
         db_control_frame.setFrameShape(QFrame.Shape.StyledPanel)
         db_control_layout = QHBoxLayout(db_control_frame)
 
-        self.btn_add_column = QPushButton("手动添加表字段")
-        self.btn_add_column.clicked.connect(self._manual_add_column)
+        # 业务表选择：目前只有合同台账；以后新增业务时在
+        # database_serv.ALLOWED_TABLES 登记即可自动出现在这里
+        db_control_layout.addWidget(QLabel("业务表:"))
+        self.table_combo = QComboBox()
+        for table_name, display_name in ALLOWED_TABLES.items():
+            self.table_combo.addItem(display_name, table_name)
+        db_control_layout.addWidget(self.table_combo)
+
+        self.btn_read_fields = QPushButton("读取现有字段")
+        self.btn_read_fields.clicked.connect(self._read_fields)
+        self.btn_adjust_fields = QPushButton("调整字段")
+        self.btn_adjust_fields.clicked.connect(self._adjust_fields)
         self.btn_ai_habit = QPushButton("AI 分析人员习惯并建议字段")
         self.btn_ai_habit.clicked.connect(self._ai_habit_suggest)
 
-        db_control_layout.addWidget(self.btn_add_column)
+        db_control_layout.addWidget(self.btn_read_fields)
+        db_control_layout.addWidget(self.btn_adjust_fields)
         db_control_layout.addWidget(self.btn_ai_habit)
         right_layout.addWidget(db_control_frame)
+
+        # 字段列表显示区：只读，仅显示字段名（+类型），不显示任何数据内容
+        right_layout.addWidget(QLabel("现有字段（仅字段名，不显示内容）"))
+        self.fields_view = QPlainTextEdit()
+        self.fields_view.setReadOnly(True)
+        self.fields_view.setMaximumHeight(120)
+        self.fields_view.setPlaceholderText("点击「读取现有字段」查看当前台账字段。")
+        right_layout.addWidget(self.fields_view)
 
         right_layout.addWidget(QLabel("运行日志"))
         self.log_view = QPlainTextEdit()
@@ -251,25 +456,59 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     # ===== 数据库与 AI 操作交互实现 =====
-    def _manual_add_column(self) -> None:
-        col_name, ok = QInputDialog.getText(self, "新增数据库字段", "请输入要扩充的英文字段名:")
-        if ok and col_name.strip():
-            success, msg = api_alter_table_field("ADD", col_name.strip())
-            if success:
-                QMessageBox.information(self, "成功", msg)
-                self._append_log(f"数据库调整：{msg}")
-            else:
-                QMessageBox.critical(self, "失败", msg)
+    def _current_business_table(self) -> str:
+        """返回当前选中的业务表名（默认合同台账）。
+
+        后续新增业务表时，下拉框会自动带出，无需改这里的逻辑。
+        """
+        return self.table_combo.currentData() or "contract_projects"
+
+    def _read_fields(self) -> None:
+        """读取现有字段：在下方字段列表区展示（仅字段名+类型，不含任何数据内容）。
+
+        权限：field:read —— 所有已登录用户（含 finance_staff）。
+        """
+        table_name = self._current_business_table()
+        ok, res = api_get_table_fields(self.current_user, table_name)
+        if not ok:
+            QMessageBox.critical(self, "读取字段失败", str(res))
+            self.fields_view.setPlainText("")
+            return
+        lines = [f"{i}. {f['column_name']}  ({f['data_type']})" for i, f in enumerate(res, 1)]
+        self.fields_view.setPlainText("\n".join(lines) if lines else "（该表暂无字段）")
+        self._append_log(f"已读取 {table_name} 的 {len(res)} 个字段")
+
+    def _adjust_fields(self) -> None:
+        """打开字段调整对话框：查看全部字段，可新增/重命名/删除后统一提交。
+
+        权限：field:write —— 仅 financial_role / admin（在 database_serv 侧校验）。
+        调整完成后自动刷新下方字段列表。
+        """
+        dialog = FieldAdjustDialog(self, self.current_user, self._current_business_table())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._read_fields()
 
     def _ai_habit_suggest(self) -> None:
         suggestion = api_ai_analyze_user_habits()
-        msg = f"【AI 建议理由】: {suggestion['reason']}\n拟新增字段: {suggestion['col_name']} ({suggestion['col_type']})\n\n是否同意修改数据库结构？"
+        msg = (
+            f"【AI 建议理由】: {suggestion['reason']}\n"
+            f"拟在表 {self._current_business_table()} 新增字段: "
+            f"{suggestion['col_name']} ({suggestion['col_type']})\n\n"
+            "是否同意修改数据库结构？"
+        )
         reply = QMessageBox.question(self, "AI 申请修改数据库结构", msg)
         if reply == QMessageBox.StandardButton.Yes:
-            success, res_msg = api_alter_table_field(suggestion["action"], suggestion["col_name"], suggestion["col_type"])
+            success, res_msg = api_alter_table_field(
+                self.current_user,
+                suggestion["action"],
+                self._current_business_table(),
+                suggestion["col_name"],
+                suggestion["col_type"],
+            )
             if success:
                 QMessageBox.information(self, "应用成功", res_msg)
                 self._append_log(f"AI 协作调整表结构成功：{res_msg}")
+                self._read_fields()
             else:
                 QMessageBox.critical(self, "调整失败", res_msg)
 
@@ -443,11 +682,30 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Table")
-    
-    from database_serv import init_db
-    db_ok, db_msg = init_db()
-    if not db_ok:
-        QMessageBox.critical(None, "数据库初始化失败", f"错误详情:\n{db_msg}")
+
+    # ===== 启动画面：数据库初始化 + OCR 模型预加载 =====
+    # 在登录前先建好数据库表并提前加载 OCR 模型（首次加载较慢），
+    # 用 splash 画面遮盖这段时间；拖入文件时模型已就绪、不再卡顿。
+    # （模块：splash.py —— SplashWindow 画面 + StartupThread 后台线程）
+    from splash import SplashWindow, StartupThread
+
+    splash = SplashWindow()
+    splash.show()
+
+    db_result: list[tuple[bool, str]] = []  # 捕获数据库初始化结果
+    startup = StartupThread()
+    startup.stage_changed.connect(splash.set_stage)
+    startup.init_db_result.connect(lambda ok, msg: db_result.append((ok, msg)))
+    startup.finished.connect(splash.close)
+    startup.start()
+
+    # 本地事件循环：驱动 splash 正常重绘，直到启动线程结束
+    loop = QEventLoop()
+    startup.finished.connect(loop.quit)
+    loop.exec()
+
+    if db_result and not db_result[0][0]:
+        QMessageBox.critical(None, "数据库初始化失败", f"错误详情:\n{db_result[0][1]}")
         return 1
 
     # 弹出登录拦截
