@@ -9,6 +9,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+# ⚠️ DLL 顺序修复（torch 必须先于 paddle 加载）：
+# paddleocr -> paddlex -> modelscope 这条导入链会在导入期 `import torch`；
+# 若 torch 在 paddle 之后加载，torch 的 shm.dll 会因 DLL 冲突报
+# WinError 127（实测：先 paddle 后 torch 必崩，先 torch 后 paddle 共存）。
+# 因此在 paddle 相关导入之前先完成 torch 加载；未安装 torch 时静默跳过。
+try:
+    import torch  # noqa: F401  # 先加载 torch，规避与 paddle 的 DLL 顺序冲突
+except Exception:  # torch 缺失/损坏时不影响扫描主流程
+    pass
+
 import paddle  # 显式引入 paddle 库
 from paddleocr import PaddleOCRVL
 from dotenv import load_dotenv
@@ -54,6 +64,12 @@ OCR_FAIL_THRESHOLD = _env_int("OCR_FAIL_THRESHOLD", 3)
 # 注意：进程内无法强杀卡死的 C++ 调用，硬超时终止需要进程级隔离（后续方案）。
 OCR_PAGE_TIMEOUT_S = _env_int("OCR_PAGE_TIMEOUT_S", 180)
 OCR_SLOW_REBUILD_LIMIT = _env_int("OCR_SLOW_REBUILD_LIMIT", 2)
+# ---- 模型重建守卫（防"重复初始化"刷屏/无限循环）----
+# 失败重试与慢页重建共用一个重建入口（_rebuild_ocr）：
+#   冷却期内不重复重建；进程内累计重建达到上限后只告警不再重建，
+#   避免慢环境（如 CPU）下"加载模型 60s -> 2 个慢页 -> 再加载"无限循环。
+OCR_REBUILD_COOLDOWN_S = _env_int("OCR_REBUILD_COOLDOWN_S", 120)
+OCR_REBUILD_MAX = _env_int("OCR_REBUILD_MAX", 3)
 # OCR 推理引擎：paddleocr 的 engine 参数默认 None 时会在
 # _common_args.prepare_common_init_args() 里强制构建 paddle_static(静态图)
 # 引擎配置，触发 "int(Tensor) is not supported in static graph mode" 报错。
@@ -144,6 +160,10 @@ def resolve_ocr_device() -> tuple[str, str]:
     return "gpu", "GPU 探测通过"
 
 
+# 记录最近一次设备探测结果（warmup_ocr 读取，避免启动时重复 resolve_ocr_device）
+_OCR_INFO = {"device": "", "reason": ""}
+
+
 @lru_cache(maxsize=1)
 def get_ocr() -> PaddleOCRVL:
     """延迟初始化 PaddleOCR-VL，避免 GUI 启动时就加载大模型。
@@ -152,11 +172,13 @@ def get_ocr() -> PaddleOCRVL:
     OCR_DEVICE 强制指定），避免小显存机器 OOM 崩溃。
     引擎选择：显式传 engine=OCR_ENGINE（默认 paddle_dynamic 动态图），
     规避 paddleocr 默认 paddle_static 静态图引擎的 int(Tensor) 报错。
+    模型实例由 lru_cache 保证进程内最多一份（除非主动 _rebuild_ocr 重建）。
     """
     # 保险起见仍禁用全局静态图模式（动态图引擎下无副作用）
     paddle.disable_static()
 
     device, reason = resolve_ocr_device()
+    _OCR_INFO["device"], _OCR_INFO["reason"] = device, reason
     print(f"[OCR] 设备选择：{device}（{reason}） | 引擎：{OCR_ENGINE}")
 
     kwargs: dict = dict(
@@ -230,6 +252,44 @@ _OCR_BREAKER = OcrCircuitBreaker(OCR_FAIL_THRESHOLD)
 _OCR_MONITOR_STATE = {"running": False, "started_at": 0.0, "hung_logged": False}
 _OCR_MONITOR_STARTED = {"flag": False}
 _OCR_SLOW_PAGES = {"count": 0}
+# 重建守卫状态：冷却时间戳 + 进程内累计重建次数（防"重复初始化"）
+_REBUILD_STATE = {"last_time": 0.0, "count": 0, "lock": threading.Lock()}
+
+
+def _rebuild_ocr(reason: str) -> bool:
+    """统一的重建模型实例入口（带冷却 + 上限，防止重复初始化）。
+
+    这是唯一允许丢弃/重载模型的地方：失败重试与慢页重建都走这里。
+      - 冷却：距上次重建 < OCR_REBUILD_COOLDOWN_S 时跳过（避免连续触发）；
+      - 上限：进程内累计重建 >= OCR_REBUILD_MAX 后只告警不再重建
+        （防止慢环境/坏环境下"加载 60s -> 慢页 -> 再加载"无限循环）。
+    返回是否真的执行了重建。
+    """
+    with _REBUILD_STATE["lock"]:
+        now = time.monotonic()
+        if _REBUILD_STATE["count"] >= OCR_REBUILD_MAX:
+            print(
+                f"[OCR] 已重建 {OCR_REBUILD_MAX} 次达到上限，不再重建（{reason}）。"
+                "请检查 GPU 显存/驱动或改用 GPU 环境。",
+                flush=True,
+            )
+            return False
+        if now - _REBUILD_STATE["last_time"] < OCR_REBUILD_COOLDOWN_S:
+            print(f"[OCR] 距上次重建不足 {OCR_REBUILD_COOLDOWN_S}s，跳过重建（{reason}）。", flush=True)
+            return False
+        _REBUILD_STATE["last_time"] = now
+        _REBUILD_STATE["count"] += 1
+        rebuild_no = _REBUILD_STATE["count"]
+
+    print(f"[OCR] 重建模型实例（第 {rebuild_no} 次，原因：{reason}）…", flush=True)
+    try:
+        get_ocr.cache_clear()  # 丢弃被污染的实例（同时释放显存）
+        get_ocr()              # 重新加载（lru_cache 重建）
+        print("[OCR] 模型重建完成。", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[OCR] 模型重建失败：{exc}", flush=True)
+        return False
 
 
 def _start_page_monitor() -> None:
@@ -255,7 +315,7 @@ def _start_page_monitor() -> None:
                         flush=True,
                     )
 
-    threading.Thread(target=_monitor, daemon=True).start()
+    threading.Thread(target=_monitor, daemon=True, name="ocr-watchdog").start()
 
 
 def _watch_slow_page(started_at: float, outcome: str) -> None:
@@ -277,13 +337,8 @@ def _watch_slow_page(started_at: float, outcome: str) -> None:
     )
     if _OCR_SLOW_PAGES["count"] >= OCR_SLOW_REBUILD_LIMIT:
         _OCR_SLOW_PAGES["count"] = 0
-        print("[OCR] 连续慢页，重建模型实例一次…", flush=True)
-        try:
-            get_ocr.cache_clear()
-            get_ocr()  # 预热重建，供后续页使用
-            print("[OCR] 模型重建完成。", flush=True)
-        except Exception:
-            pass
+        # 统一走 _rebuild_ocr：带冷却+上限，防止慢环境无限循环重建
+        _rebuild_ocr(f"连续 {OCR_SLOW_REBUILD_LIMIT} 个慢页")
 
 
 def _raise_ocr_failure(exc: Exception) -> None:
@@ -316,24 +371,40 @@ def predict_safely(image_path, *, _retried: bool = False) -> list:
     _OCR_MONITOR_STATE["started_at"] = time.monotonic()
     _OCR_MONITOR_STATE["hung_logged"] = False
     t0 = time.monotonic()
+    # 每页 GPU 打点：开始/结束快照 + 耗时，写入 perf_monitor 日志（monitor.py）
+    # 目的：一眼看出"这一页是 GPU 在算还是 CPU 在算、显存变化多少"。
+    try:
+        from monitor import log_snapshot_now
+
+        gpu_before = log_snapshot_now(f"predict 开始 {Path(image_path).name}")
+    except Exception:
+        gpu_before = {}
     try:
         results = get_ocr().predict(str(image_path))
         _OCR_BREAKER.record_success()
+        try:
+            from monitor import log_snapshot_now
+
+            gpu_after = log_snapshot_now(f"predict 结束 {Path(image_path).name}")
+        except Exception:
+            gpu_after = {}
         _watch_slow_page(t0, "完成")
+        print(
+            f"[OCR] 单页完成 {Path(image_path).name} 耗时 {time.monotonic() - t0:.1f}s | "
+            f"GPU利用(始/终) {gpu_before.get('gpu_util_pct', 'NA')}%/{gpu_after.get('gpu_util_pct', 'NA')}% | "
+            f"显存 {gpu_before.get('mem_used_mb', 'NA')}->{gpu_after.get('mem_used_mb', 'NA')}MB",
+            flush=True,
+        )
         return results
     except Exception as exc:
         _watch_slow_page(t0, "失败")
         if not _retried:
-            # 丢弃被污染的模型实例（同时释放显存），重建后重试一次
-            print(f"[OCR] 预测失败（{type(exc).__name__}），正在重建模型后重试一次…", flush=True)
-            try:
-                get_ocr.cache_clear()
-            except Exception:
-                pass
+            # 统一走 _rebuild_ocr（带冷却+上限）丢弃被污染实例后再重试一次
+            _rebuild_ocr(f"预测失败（{type(exc).__name__}）")
             try:
                 results = get_ocr().predict(str(image_path))
                 _OCR_BREAKER.record_success()
-                print("[OCR] 重建模型后重试成功。", flush=True)
+                print("[OCR] 重建后重试成功。", flush=True)
                 return results
             except Exception as exc2:
                 _raise_ocr_failure(exc2)
@@ -347,13 +418,14 @@ def warmup_ocr() -> dict:
 
     在登录/主窗口显示之前调用一次，把模型加载耗时从「拖入文件那一刻」
     转移到启动阶段；配合启动画面（splash）即可消除拖拽瞬间的卡顿。
+    注意：这里不再单独调 resolve_ocr_device()——get_ocr() 内部会解析一次
+    并写入 _OCR_INFO，避免启动路径重复探测/重复打印。
     返回环境探测结果，便于 UI 提示用户当前运行模式。
     """
-    device, reason = resolve_ocr_device()
     get_ocr()  # 触发 lru_cache 完成模型初始化
     return {
-        "device": device,
-        "reason": reason,
+        "device": _OCR_INFO.get("device", ""),
+        "reason": _OCR_INFO.get("reason", ""),
         "tripped": _OCR_BREAKER.tripped,
     }
 

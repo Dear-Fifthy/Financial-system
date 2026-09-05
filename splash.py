@@ -91,12 +91,12 @@ class StartupThread(QThread):
         self.init_db_result.emit(db_ok, db_msg)
 
         # 2-3. OCR 预加载：失败不阻断启动，模型会按需惰性加载 + 熔断保护
+        # 注意：warmup_ocr 内部已做设备探测+模型加载（get_ocr 解析一次并记录），
+        # 这里不再单独调用 resolve_ocr_device()，避免启动路径重复探测/重复打印。
         try:
-            from scanner_core import resolve_ocr_device, warmup_ocr
+            from scanner_core import warmup_ocr
 
-            self.stage_changed.emit("检测 GPU / 显存…")
-            resolve_ocr_device()
-            self.stage_changed.emit("加载 OCR 模型…")
+            self.stage_changed.emit("检测 GPU / 显存并加载 OCR 模型…")
             result = warmup_ocr()
             self.warmup_result.emit(result)
         except Exception as exc:

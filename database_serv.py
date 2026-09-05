@@ -119,8 +119,21 @@ def init_db() -> tuple[bool, str]:
 # 3. 业务数据提交 (使用认证通过后的 finance_app_role)
 # =========================================================
 def get_connection():
-    """获取应用专属数据库连接"""
+    """获取应用专属数据库连接（数据读写用，权限受限）。"""
     return psycopg2.connect(**APP_DB_CONFIG)
+
+
+def get_admin_connection():
+    """获取"管理员 + 业务库"连接（表结构 DDL 用）。
+
+    PostgreSQL 规定 ALTER TABLE 必须由表属主执行；业务表属主是 postgres
+    管理员（init_db 时创建），而 finance_app_role 只有 DML 权限。
+    因此"调整字段/重命名字段"这类 DDL 走本连接（管理员凭据来自 .env），
+    业务层权限仍由 require_permission(field:write) 把关。
+    """
+    cfg = ADMIN_DB_CONFIG.copy()
+    cfg["dbname"] = os.getenv("APP_DB_NAME", "fin_system_db")
+    return psycopg2.connect(**cfg)
 
 
 def hash_pwd(password: str) -> str:
@@ -165,35 +178,96 @@ def authenticate_user(username: str, password: str) -> tuple[bool, dict | str]:
 
 
 # ===== 2. AI 识别合同数据写入 API =====
-def api_save_contract_from_ai(ai_parsed_json: dict) -> tuple[bool, str]:
-    """将 AI 提取的合同 JSON 数据存入数据库。
+# 固定栏目的"英文键 -> 中文列名"（这些列建表即有）；用户新增的自定义栏目
+# 通过 ai_parsed_json["extra_fields"] 传入，列名须命中实际表列才写入。
+# 注意：是否已收款/是否已开票 **不在此列**——状态默认"未"（列 DEFAULT FALSE），
+# 且只允许人工在台账状态界面切换，AI 不得写入。
+_FIXED_COLUMN_KEYS = [
+    ("contract_code", "合同编号"),
+    ("contract_term", "合同期限"),
+    ("party_a", "甲方"),
+    ("income", "合同金额"),
+    ("project", "项目"),
+    ("remark", "备注"),
+]
+# 覆盖语义：以下列"新值非空才覆盖"（防止重新处理冲掉旧备注）
+_COALESCE_COLUMNS = {"项目", "备注"}
 
-    ai_parsed_json 的 key 仍然用英文（contract_code/contract_term/party_a/
-    income/is_paid），只是内部 Python 变量名方便维护；实际写入数据库的
-    列名（台账栏目）已经是中文，财务人员直接查表/导出时看到的就是中文。
+
+def _get_actual_table_columns(table_name: str) -> set[str]:
+    """读取表中实际存在的列名（information_schema，实时）。"""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table_name,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def api_save_contract_from_ai(ai_parsed_json: dict, table_name: str = "contract_projects") -> tuple[bool, str]:
+    """将 AI 提取的合同 JSON 数据存入数据库（同合同编号：最新版覆盖）。
+
+    固定栏目用英文键（见 _FIXED_COLUMN_KEYS）；用户新增的自定义栏目经
+    ai_parsed_json["extra_fields"] 传入（键=中文栏目名），**只写入表里实际
+    存在的列**（先实时读 information_schema 校验），列名过白名单正则，防注入。
+
+    覆盖语义：合同期限/甲方/合同金额 直接覆盖；是否已收款/是否已开票/项目/备注
+    新值非空才覆盖（人工状态保护）。返回消息注明"新增/覆盖"。
     """
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
     try:
+        # 实时读取表里实际存在的列（用户可能通过字段调整功能删除/新增栏目）
+        actual_cols = _get_actual_table_columns(table_name)
+
+        # 固定列：只保留表里实际存在的列（"合同期限"等被删后不再写入）
+        fixed: dict[str, object] = {}
+        for key, col in _FIXED_COLUMN_KEYS:
+            if col in actual_cols:
+                fixed[col] = ai_parsed_json.get(key)
+        if "合同编号" not in fixed:
+            return False, f"台账缺少唯一键列【合同编号】，无法写入！"
+        if "合同金额" in fixed:
+            fixed["合同金额"] = ai_parsed_json.get("income", 0.0)
+        # 是否已收款/是否已开票 不在此写入：状态默认"未"、只允许人工切换
+
+        # 自定义栏目：仅接受"实际存在的列"且列名合法（防注入）
+        extras: dict[str, object] = {}
+        for col, val in (ai_parsed_json.get("extra_fields") or {}).items():
+            if (
+                col in actual_cols
+                and col not in fixed
+                and isinstance(col, str)
+                and re.match(r"^[\w\u4e00-\u9fa5]+$", col)
+            ):
+                extras[col] = val
+
+        col_names = [f'"{c}"' for c in fixed] + [f'"{c}"' for c in extras]
+        placeholders = ", ".join(["%s"] * len(col_names))
+        update_sets = [
+            f'"{c}" = EXCLUDED."{c}"' for c in fixed if c not in _COALESCE_COLUMNS
+        ] + [
+            f'"{c}" = COALESCE(EXCLUDED."{c}", {table_name}."{c}")' for c in fixed if c in _COALESCE_COLUMNS
+        ] + [
+            f'"{c}" = EXCLUDED."{c}"' for c in extras
+        ]
+        sql = (
+            f'INSERT INTO {table_name} ({", ".join(col_names)}) VALUES ({placeholders}) '
+            f'ON CONFLICT ("合同编号") DO UPDATE SET ' + ", ".join(update_sets)
+            + " RETURNING (xmax = 0) AS inserted"
+        )
+        params = [fixed[c] for c in fixed] + [extras[c] for c in extras]
+
         with get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO contract_projects ("合同编号", "合同期限", "甲方", "合同金额", "是否已收款")
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT ("合同编号") DO UPDATE
-                SET "合同期限" = EXCLUDED."合同期限",
-                    "甲方" = EXCLUDED."甲方",
-                    "合同金额" = EXCLUDED."合同金额",
-                    "是否已收款" = EXCLUDED."是否已收款";
-            """,
-                (
-                    ai_parsed_json.get("contract_code"),
-                    ai_parsed_json.get("contract_term"),
-                    ai_parsed_json.get("party_a"),
-                    ai_parsed_json.get("income", 0.0),
-                    ai_parsed_json.get("is_paid", False),
-                ),
-            )
+            cur.execute(sql, params)
+            inserted = bool(cur.fetchone()[0])
             conn.commit()
-            return True, "数据已同步保存至 PostgreSQL 数据库！"
+        code = ai_parsed_json.get("contract_code")
+        if inserted:
+            return True, f"已新增台账行（合同编号：{code}）"
+        return True, f"同合同编号已存在，已按最新版覆盖（合同编号：{code}）"
     except Exception as exc:
         return False, f"存入数据库失败: {exc}"
 
@@ -211,6 +285,7 @@ ALLOWED_TABLES: dict[str, str] = {
 # 字段权限点定义：读/写分离（financial_role 拥有最高权限）
 FIELD_READ_PERMISSION = "field:read"    # 读取字段（所有已登录用户）
 FIELD_WRITE_PERMISSION = "field:write"  # 调整字段（仅 financial_role / admin）
+LEDGER_STATUS_PERMISSION = "ledger:status"  # 台账状态人工切换（已收款/已开票）
 
 # 角色 -> 权限集合（内存兜底映射）。
 # 说明：role_type 来自 sys_users（默认 finance_staff）；financial_role 为内置
@@ -219,8 +294,8 @@ FIELD_WRITE_PERMISSION = "field:write"  # 调整字段（仅 financial_role / ad
 # 本字典仅在数据库未初始化时兜底。
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "finance_staff": {FIELD_READ_PERMISSION},
-    "financial_role": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION},
-    "admin": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION},
+    "financial_role": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION},
+    "admin": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION},
 }
 
 
@@ -309,7 +384,9 @@ def api_alter_table_field(
 ) -> tuple[bool, str]:
     """调整表字段（ADD 新增 / DROP 删除列）。
 
-    权限：field:write —— 仅 financial_role / admin。
+    权限：field:write —— 仅 financial_role / admin（业务层校验）。
+    DDL 执行层：用 get_admin_connection()（管理员连接）——ALTER TABLE 必须
+    由表属主执行，finance_app_role 应用角色没有 DDL 权限。
     字段名支持中英文+数字+下划线；表名必须命中 ALLOWED_TABLES 白名单；
     新增时 col_type 必须命中 ALLOWED_COLUMN_TYPES 白名单。
     返回：(是否成功, 提示信息)。
@@ -324,7 +401,7 @@ def api_alter_table_field(
         return False, "字段名只能包含中英文、数字和下划线！"
 
     try:
-        with get_connection() as conn, conn.cursor() as cur:
+        with get_admin_connection() as conn, conn.cursor() as cur:
             quoted_col = f'"{col_name}"'
             if action_type.upper() == "ADD":
                 if col_type.upper() not in ALLOWED_COLUMN_TYPES:
@@ -345,7 +422,8 @@ def api_alter_table_field(
 def api_rename_table_field(user: dict | None, table_name: str, old_name: str, new_name: str) -> tuple[bool, str]:
     """重命名表字段。
 
-    权限：field:write —— 仅 financial_role / admin。
+    权限：field:write —— 仅 financial_role / admin（业务层校验）。
+    DDL 执行层：用 get_admin_connection()（ALTER TABLE 需表属主权限）。
     ⚠️ 注意：重命名会影响写入该列的代码（如 api_save_contract_from_ai 里
     写死的列名），建议只对用户扩展的自定义字段重命名；内置字段
     （合同编号/甲方/合同金额等）如需改名，必须同步修改入库 SQL。
@@ -363,7 +441,7 @@ def api_rename_table_field(user: dict | None, table_name: str, old_name: str, ne
         return False, "新旧字段名相同，无需修改！"
 
     try:
-        with get_connection() as conn, conn.cursor() as cur:
+        with get_admin_connection() as conn, conn.cursor() as cur:
             cur.execute(f'ALTER TABLE {table_name} RENAME COLUMN "{old_name}" TO "{new_name}";')
             conn.commit()
             return True, f"字段重命名成功：{old_name} -> {new_name}"
@@ -580,3 +658,180 @@ def import_entity_mapping_json() -> tuple[int, str]:
                 store.get_or_create_code(category, real_value)
             count += 1
     return count, f"已导入 {count} 条映射（重复键自动跳过）"
+
+
+# =========================================================
+# 6. 台账扩展 API（AI 协作 + 人工状态管理）
+# =========================================================
+def api_get_ledger_project_notes(
+    user: dict | None, table_name: str = "contract_projects", limit: int = 200
+) -> tuple[bool, list[dict] | str]:
+    """只读取台账的【项目栏 + 备注栏】两列（供 AI 学习备注习惯、匹配已有项目）。
+
+    权限：field:read（所有已登录用户）。
+    ⚠️ 刻意只返回这两列：AI 可见范围被限制在"项目+备注"，
+    金额/甲方等其它列不经过此接口传给 AI。
+    """
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f'SELECT "项目", "备注" FROM {table_name} WHERE "项目" IS NOT NULL '
+                f"ORDER BY id DESC LIMIT %s",
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            return True, rows
+    except Exception as exc:
+        return False, f"读取项目/备注失败: {exc}"
+
+
+def api_list_contracts(user: dict | None, table_name: str = "contract_projects") -> tuple[bool, list[dict] | str]:
+    """列出台账全部合同（状态管理对话框用：编号/项目/金额/已收款/已开票）。"""
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f'SELECT "合同编号", "项目", "合同金额", "是否已收款", "是否已开票" '
+                f"FROM {table_name} ORDER BY id DESC"
+            )
+            return True, [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        return False, f"读取台账失败: {exc}"
+
+
+def api_set_contract_status(
+    user: dict | None,
+    contract_code: str,
+    paid: bool | None = None,
+    invoiced: bool | None = None,
+    table_name: str = "contract_projects",
+) -> tuple[bool, str]:
+    """人工切换台账状态：是否已收款 / 是否已开票（默认未，可手动改为已）。
+
+    权限：ledger:status（financial_role / admin）。
+    """
+    ok, msg = require_permission(user, LEDGER_STATUS_PERMISSION)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    if paid is None and invoiced is None:
+        return False, "未指定要修改的状态！"
+    try:
+        sets, params = [], []
+        if paid is not None:
+            sets.append(f'"是否已收款" = %s')
+            params.append(bool(paid))
+        if invoiced is not None:
+            sets.append(f'"是否已开票" = %s')
+            params.append(bool(invoiced))
+        params.append(contract_code)
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE {table_name} SET ' + ", ".join(sets) + ' WHERE "合同编号" = %s',
+                params,
+            )
+            conn.commit()
+            return cur.rowcount > 0, "台账状态已更新！" if cur.rowcount else "未找到该合同编号！"
+    except Exception as exc:
+        return False, f"更新台账状态失败: {exc}"
+
+
+def api_save_feature_hashes(
+    user: dict | None, doc_key: str, features: dict[str, str], seq: int = 0
+) -> tuple[bool, str]:
+    """保存一份文件的特征哈希（feature_code -> value_hash）。
+
+    权限：field:read（AI 归档由本机内部调用，登录用户上下文即可）。
+    先删旧再插入，保证幂等重建。
+    """
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    if not features:
+        return False, "没有可保存的特征！"
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM file_feature_hashes WHERE doc_key = %s AND seq = %s", (doc_key, seq)
+            )
+            for feature_code, value_hash in features.items():
+                cur.execute(
+                    "INSERT INTO file_feature_hashes (doc_key, feature_code, value_hash, seq) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (doc_key, feature_code, value_hash, seq),
+                )
+            conn.commit()
+            return True, f"已保存 {len(features)} 条特征哈希（{doc_key}）"
+    except Exception as exc:
+        return False, f"保存特征哈希失败: {exc}"
+
+
+def api_get_feature_catalog(user: dict | None) -> tuple[bool, list[dict] | str]:
+    """读取特征目录（AI 特征分类的可选范围）。"""
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    try:
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT feature_code, feature_name, is_mandatory, category, description "
+                "FROM feature_catalog ORDER BY is_mandatory DESC, feature_code"
+            )
+            return True, [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        return False, f"读取特征目录失败: {exc}"
+
+
+def api_upsert_project(
+    user: dict | None,
+    project_name: str,
+    name_hash: str,
+    parent_name: str | None = None,
+    parent_hash: str | None = None,
+    seq: int = 0,
+) -> tuple[bool, str]:
+    """项目归档：大/小项目层级（分公司/子公司同抬头哈希 + 子序号）。
+
+    权限：field:read（AI 归档由本机内部调用）。
+    """
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            parent_id = None
+            if parent_hash:
+                cur.execute("SELECT project_id FROM project_archive WHERE name_hash = %s", (parent_hash,))
+                row = cur.fetchone()
+                if row:
+                    parent_id = row[0]
+                elif parent_name:
+                    cur.execute(
+                        "INSERT INTO project_archive (project_name, name_hash, seq) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (name_hash) DO NOTHING RETURNING project_id",
+                        (parent_name, parent_hash, 0),
+                    )
+                    row = cur.fetchone()
+                    parent_id = row[0] if row else None
+            cur.execute(
+                "INSERT INTO project_archive (parent_id, project_name, name_hash, seq) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (name_hash) DO UPDATE SET parent_id = EXCLUDED.parent_id, seq = EXCLUDED.seq",
+                (parent_id, project_name, name_hash, seq),
+            )
+            conn.commit()
+            return True, f"项目已归档：{project_name}"
+    except Exception as exc:
+        return False, f"项目归档失败: {exc}"

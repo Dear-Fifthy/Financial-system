@@ -10,11 +10,13 @@ from PySide6.QtCore import QEventLoop, QObject, QThread, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -25,9 +27,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+
 
 # 引入数据库与 API 服务层
 from database_serv import (
@@ -36,8 +42,10 @@ from database_serv import (
     api_ai_analyze_user_habits,
     api_alter_table_field,
     api_get_table_fields,
+    api_list_contracts,
     api_rename_table_field,
     api_save_contract_from_ai,
+    api_set_contract_status,
     authenticate_user,
     register_user,
 )
@@ -305,6 +313,95 @@ class FieldAdjustDialog(QDialog):
         self.accept()
 
 
+# ===== 台账状态管理对话框（已收款 / 已开票 手动切换，初始默认未）=====
+class LedgerStatusDialog(QDialog):
+    """台账状态管理：列出全部合同，勾选/取消"已收款、已开票"，保存后落库。
+
+    权限：ledger:status（financial_role / admin，在 database_serv 侧校验）。
+    状态初始默认"未"（数据库 DEFAULT FALSE），人工在此手动切换。
+    """
+
+    def __init__(self, parent, current_user: dict, table_name: str = "contract_projects") -> None:
+        super().__init__(parent)
+        self.current_user = current_user
+        self.table_name = table_name
+        self._rows: list[dict] = []
+        self.setWindowTitle(f"台账状态管理 - {table_name}")
+        self.resize(720, 480)
+        self._build_ui()
+        self._load()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("勾选 = 已；取消 = 未（默认未）。修改后点「保存状态」。"))
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["合同编号", "项目", "合同金额", "已收款", "已开票"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_save = QPushButton("保存状态")
+        self.btn_save.clicked.connect(self._save)
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+    def _load(self) -> None:
+        ok, res = api_list_contracts(self.current_user, self.table_name)
+        if not ok:
+            QMessageBox.critical(self, "读取台账失败", str(res))
+            return
+        self._rows = list(res)
+        self.table.setRowCount(len(self._rows))
+        for i, row in enumerate(self._rows):
+            self.table.setItem(i, 0, QTableWidgetItem(str(row.get("合同编号", ""))))
+            self.table.setItem(i, 1, QTableWidgetItem(str(row.get("项目", "") or "")))
+            self.table.setItem(i, 2, QTableWidgetItem(str(row.get("合同金额", ""))))
+
+            paid = QCheckBox()
+            paid.setChecked(bool(row.get("是否已收款", False)))
+            paid.setText("已收款")
+            self.table.setCellWidget(i, 3, paid)
+
+            invoiced = QCheckBox()
+            invoiced.setChecked(bool(row.get("是否已开票", False)))
+            invoiced.setText("已开票")
+            self.table.setCellWidget(i, 4, invoiced)
+
+    def _save(self) -> None:
+        """对勾选状态与数据库不一致的行逐个提交 api_set_contract_status。"""
+        results: list[str] = []
+        for i, row in enumerate(self._rows):
+            code = row.get("合同编号")
+            if not code:
+                continue
+            paid_box: QCheckBox = self.table.cellWidget(i, 3)
+            invoiced_box: QCheckBox = self.table.cellWidget(i, 4)
+            new_paid = paid_box.isChecked()
+            new_invoiced = invoiced_box.isChecked()
+            if new_paid == bool(row.get("是否已收款", False)) and new_invoiced == bool(row.get("是否已开票", False)):
+                continue  # 未变更
+            ok, msg = api_set_contract_status(
+                self.current_user,
+                code,
+                paid=new_paid if new_paid != bool(row.get("是否已收款", False)) else None,
+                invoiced=new_invoiced if new_invoiced != bool(row.get("是否已开票", False)) else None,
+                table_name=self.table_name,
+            )
+            results.append(("✅ " if ok else "❌ ") + f"{code}: {msg}")
+        if not results:
+            QMessageBox.information(self, "提示", "没有需要保存的变更。")
+            return
+        QMessageBox.information(self, "保存结果", "\n".join(results) if results else "全部成功")
+        self._load()
+
+
 @dataclass
 class TaskRecord:
     file_path: Path
@@ -425,11 +522,14 @@ class MainWindow(QMainWindow):
         self.btn_read_fields.clicked.connect(self._read_fields)
         self.btn_adjust_fields = QPushButton("调整字段")
         self.btn_adjust_fields.clicked.connect(self._adjust_fields)
+        self.btn_ledger_status = QPushButton("台账状态")
+        self.btn_ledger_status.clicked.connect(self._ledger_status)
         self.btn_ai_habit = QPushButton("AI 分析人员习惯并建议字段")
         self.btn_ai_habit.clicked.connect(self._ai_habit_suggest)
 
         db_control_layout.addWidget(self.btn_read_fields)
         db_control_layout.addWidget(self.btn_adjust_fields)
+        db_control_layout.addWidget(self.btn_ledger_status)
         db_control_layout.addWidget(self.btn_ai_habit)
         right_layout.addWidget(db_control_frame)
 
@@ -487,6 +587,14 @@ class MainWindow(QMainWindow):
         dialog = FieldAdjustDialog(self, self.current_user, self._current_business_table())
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._read_fields()
+
+    def _ledger_status(self) -> None:
+        """打开台账状态管理：手动切换 已收款 / 已开票（默认未）。
+
+        权限：ledger:status —— financial_role / admin。
+        """
+        dialog = LedgerStatusDialog(self, self.current_user, self._current_business_table())
+        dialog.exec()
 
     def _ai_habit_suggest(self) -> None:
         suggestion = api_ai_analyze_user_habits()
@@ -633,6 +741,25 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._append_log(f"合同台账写入失败: {exc}")
 
+        # AI 台账填写：若文件标题识别不到合同编号（need_code），弹窗请用户输入后补存
+        ai_report = result.get("ai_report") if isinstance(result, dict) else None
+        if isinstance(ai_report, dict):
+            ledger = ai_report.get("ledger") or {}
+            if ledger.get("need_code") and ledger.get("fields"):
+                code, ok_input = QInputDialog.getText(
+                    self, "合同编号", "文件标题中未识别到合同编号，请人工输入："
+                )
+                if ok_input and code.strip():
+                    fields = dict(ledger["fields"])
+                    fields["contract_code"] = code.strip()
+                    try:
+                        ok_save, msg_save = api_save_contract_from_ai(fields)
+                        self._append_log(f"人工补录合同编号（{code.strip()}）: {msg_save}")
+                    except Exception as exc:
+                        self._append_log(f"人工补录合同编号失败: {exc}")
+                else:
+                    self._append_log("未输入合同编号，本份合同未写入台账（可稍后处理）")
+
         self._load_preview_for_path(file_path)
 
     def _on_task_failed(self, file_path_text: str, error_text: str) -> None:
@@ -682,6 +809,15 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Table")
+
+    # 启动性能监控（线程/CPU/GPU 采样 -> logs/perf_monitor.log），
+    # 用于诊断"扫描慢是程序问题还是模型问题"；失败不影响主流程。
+    try:
+        from monitor import start_performance_monitor
+
+        start_performance_monitor()
+    except Exception:
+        pass
 
     # ===== 启动画面：数据库初始化 + OCR 模型预加载 =====
     # 在登录前先建好数据库表并提前加载 OCR 模型（首次加载较慢），

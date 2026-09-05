@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import threading
@@ -239,13 +240,12 @@ def desensitize_text(text: str, store: MappingDbStore) -> str:
 # 单文件端到端入口
 # =========================================================
 def extract_contract_fields(file_stem: str, desensitized_pages: list[str], store: MappingDbStore) -> dict:
-    """从脱敏后的文本里，把能可靠拿到的台账字段先填上。
+    """【AI 关闭时的正则兜底】从脱敏文本里取能可靠识别的台账字段。
 
-    ⚠️ 目前只有"甲方"能可靠识别（复用 PARTY_A_RE 在脱敏文本里找编码再反查
-    真实名称）。"合同编号"和"合同金额"格式五花八门，正则不靠谱，这里先用
-    占位值垫上保证能入库，等第5步接上外部 AI API 解析之后，应该用解析出
-    的真实值覆盖这两个字段（可以直接调 database_serv.api_save_contract_from_ai
-    再写一次，靠"合同编号"做 ON CONFLICT 更新）。
+    ⚠️ 仅当 AI 未启用时才由 process_file_to_hub 产出（AI 启用时台账写入
+    归 AI 路径所有，避免双写/重复行）。合同编号只从文件名提取（与 AI 路径
+    同一规则），绝不再用 PENDING 占位——PENDING 会造成新旧键不一致、
+    同合同无法覆盖、产生重复行。
     """
     combined = "\n".join(desensitized_pages)
 
@@ -253,17 +253,20 @@ def extract_contract_fields(file_stem: str, desensitized_pages: list[str], store
     match_a = PARTY_A_RE.search(combined)
     if match_a:
         # 脱敏后文本形如"甲方：CO0002"，组1(下划线内)为空、组2(常规文本)是编码；
-        # 兼容下划线格式时组1/组3才是内容。取其一（修复：之前只取组1，
-        # 无下划线时 group(1) 为 None 会直接崩溃）。
+        # 兼容下划线格式时组1/组3才是内容。取其一。
         value = match_a.group(1) or match_a.group(2) or match_a.group(3)
         if value:
             party_a_real = store.lookup_real_value(value)
 
+    from ai_parser import extract_contract_code_from_filename  # 惰性导入（同规则取编号）
+
+    contract_code = extract_contract_code_from_filename(file_stem)
     return {
-        "contract_code": f"PENDING-{file_stem}",  # 占位编号，等AI解析后应替换成真实合同编号
-        "contract_term": None,  # 留给AI解析步骤补全
+        # 文件名识别不到编号时用"无编号-"标记（绝不用 PENDING，避免与 AI 键冲突）
+        "contract_code": contract_code or f"无编号-{file_stem}",
+        "contract_term": None,
         "party_a": party_a_real or "待人工核对",
-        "income": 0.0,  # 留给AI解析步骤补全
+        "income": 0.0,
         "is_paid": False,
     }
 
@@ -305,7 +308,7 @@ def process_file_to_hub(file_path: Path, current_user: dict | None = None) -> di
         except Exception as exc:
             consumer_errors.append(exc)
 
-    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    consumer_thread = threading.Thread(target=consumer, daemon=True, name="hub-desensitize")
     consumer_thread.start()
     try:
         # 生产端：逐页扫描（每页 OCR 完立刻回调，不等后续页）
@@ -342,6 +345,24 @@ def process_file_to_hub(file_path: Path, current_user: dict | None = None) -> di
         "hub_json_path": out_path,
         "cache_json_paths": cache_paths,
     }
-    if category == "合同":
+    # 台账写入职责划分（修复"双写/重复行"）：
+    # - AI 启用：台账由 AI 路径（process_hub_file -> fill_contract_ledger，文件名编号 +
+    #   AI 填项目/备注/自定义栏目）写入；这里**不再**产出正则版 contract_fields，
+    #   否则 table.py 会把正则行（无项目/备注、明文甲方）再写一次或覆盖 AI 行；
+    # - AI 关闭：才保留正则兜底 contract_fields（编号已改为文件名提取，不再 PENDING）。
+    ai_active = os.getenv("AI_ENABLED", "0") == "1" and bool(os.getenv("AI_API_KEY", ""))
+    if category == "合同" and not ai_active:
         result["contract_fields"] = extract_contract_fields(file_path.stem, desensitized_pages, store)
+
+    # 5. AI 协作（可选）：特征哈希归档 + (合同)台账填写 + 条款摘要 + 分块向量化。
+    #    开关：.env 中 AI_ENABLED=1 且已配置 AI_API_KEY；任何一步失败都不阻断主流程，
+    #    结果/错误放入 result["ai_report"] / result["ai_error"] 供 UI 展示。
+    if ai_active:
+        try:
+            from ai_parser import process_hub_file
+
+            result["ai_report"] = process_hub_file(out_path, current_user)
+        except Exception as exc:
+            result["ai_error"] = f"{type(exc).__name__}: {exc}"
+
     return result

@@ -6,3 +6,4 @@ output/
 .env
 hub/
 hub_encryption.key
+logs/
