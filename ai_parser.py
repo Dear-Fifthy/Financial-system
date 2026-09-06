@@ -67,6 +67,12 @@ def load_ai_config() -> dict:
     }
 
 
+# 发给 AI 的单份文档文本上限（字符）：控制单次调用输入成本。
+# 已从 12000 上调至 30000——模型上下文充裕，长合同/多页单据也能读全；
+# 仍按输入 token 计费，可用 .env 的 AI_MAX_DOC_CHARS 覆盖。
+AI_MAX_DOC_CHARS = int(os.getenv("AI_MAX_DOC_CHARS", "30000"))
+
+
 def ai_enabled() -> bool:
     """是否启用 AI 处理：AI_ENABLED=1 且已配置 API key。"""
     return os.getenv("AI_ENABLED", "0") == "1" and bool(os.getenv("AI_API_KEY", ""))
@@ -280,7 +286,7 @@ FEATURE_EXTRACT_SYSTEM = """你是财务文档特征提取器。
 
 def extract_features(doc_text: str) -> dict:
     """让 AI 从脱敏文本提取特征值（只回传特征值文本，不做哈希）。"""
-    payload = _ask_json(FEATURE_EXTRACT_SYSTEM, doc_text[:12000])
+    payload = _ask_json(FEATURE_EXTRACT_SYSTEM, doc_text[:AI_MAX_DOC_CHARS])
     return {k: (v if v is not None else "") for k, v in payload.items() if isinstance(v, (str, list))}
 
 
@@ -486,7 +492,7 @@ def fill_contract_ledger(hub_json_path: Path, current_user: dict | None = None) 
 
     payload = _ask_json(
         system,
-        f"【文件来源】{source_name}\n\n【合同文本】\n{doc_text[:12000]}\n\n【历史 项目栏+备注栏】\n{history_text}",
+        f"【文件来源】{source_name}\n\n【合同文本】\n{doc_text[:AI_MAX_DOC_CHARS]}\n\n【历史 项目栏+备注栏】\n{history_text}",
     )
     _ai_log(f"[台账填写] AI 输出的 JSON 键：{sorted(payload.keys())}")
     # 诊断"AI 输出与 pg 栏目不符"：把 AI 的键映射回栏目名，标出对应栏目已不存在的
@@ -547,7 +553,7 @@ SUMMARY_SYSTEM = """你是合同条款摘要员。输入【已脱敏】合同文
 
 def summarize_clauses(doc_text: str) -> str:
     """生成条款摘要（期限/金额/付款/违约/其它）。"""
-    payload = _ask_json(SUMMARY_SYSTEM, doc_text[:12000])
+    payload = _ask_json(SUMMARY_SYSTEM, doc_text[:AI_MAX_DOC_CHARS])
     return str(payload.get("summary", ""))
 
 

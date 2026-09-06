@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -41,14 +42,32 @@ from database_serv import (
     ALLOWED_TABLES,
     api_ai_analyze_user_habits,
     api_alter_table_field,
+    api_deactivate_self,
     api_get_table_fields,
     api_list_contracts,
+    api_list_users,
     api_rename_table_field,
     api_save_contract_from_ai,
     api_set_contract_status,
+    api_set_key_column,
+    api_toggle_user_active,
+    api_transfer_admin,
     authenticate_user,
     register_user,
 )
+
+
+# 角色英文标识 -> 中文显示名（界面统一展示用）
+ROLE_LABELS = {
+    "admin": "最高管理员",
+    "financial_role": "财务主管",
+    "finance_staff": "财务专员",
+}
+
+
+def _role_label(role: str) -> str:
+    """角色英文标识转中文；未知值原样返回（便于发现未登记的新角色）。"""
+    return ROLE_LABELS.get(role, role or "未知")
 
 
 # ===== 新增：登录/注册弹窗 =====
@@ -136,17 +155,23 @@ class LoginRegisterDialog(QDialog):
 class FieldAdjustDialog(QDialog):
     """字段调整对话框。
 
-    展示指定业务表的全部字段（名称+类型），支持：
-      - 新增字段（名称 + 白名单类型）
-      - 重命名选中字段
-      - 删除选中字段
+    展示指定业务表的全部字段（名称+类型+语义标记），支持：
+      - 新增字段（名称 + 白名单类型）           -> ADD
+      - 重命名选中字段（内置列同样允许）        -> RENAME
+      - 设为唯一键（删除唯一键列前先移交键）    -> SETKEY
+      - 删除选中字段（系统列/唯一键列受保护）   -> DROP
     所有变更先收集到 self._ops，点「确定」后按顺序提交给 database_serv
     （权限：field:write，仅 financial_role / admin）。
+    语义标记「系统/唯一键/人工状态」来自列目录 column_catalog（database_serv
+    自动对账维护），字段列表本身永远以数据库实际存在的物理列（information_schema）
+    为准——删除列后目录行由服务端下次读取时自动清理，列表不会残留。
 
     业务扩展说明：以后新增其它业务表（发票/物流等）时，只需把表名登记进
     database_serv.ALLOWED_TABLES，本对话框即可复用，互不影响。
-    ⚠️ 建议只调整用户扩展的自定义字段；内置字段（合同编号/甲方等）重命名
-    会导致入库 SQL 失效（见 api_rename_table_field 注释）。
+    ⚠️ 说明：内置列（合同编号/甲方等）现可删除/改名，其语义标志（唯一键/
+    人工状态等）由列目录保留；但台账写入/AI 等旧版代码仍按写死的中文列名运行，
+    对它们引用的列做改名/删除会导致相关功能报错（见 database_serv 中
+    api_rename_table_field / api_alter_table_field 的文档化局限）。
     """
 
     def __init__(self, parent, current_user: dict, table_name: str) -> None:
@@ -175,10 +200,13 @@ class FieldAdjustDialog(QDialog):
         self.btn_add.clicked.connect(self._add_field)
         self.btn_rename = QPushButton("重命名选中")
         self.btn_rename.clicked.connect(self._rename_selected)
+        self.btn_set_key = QPushButton("设为唯一键")
+        self.btn_set_key.clicked.connect(self._set_key_selected)
         self.btn_delete = QPushButton("删除选中")
         self.btn_delete.clicked.connect(self._delete_selected)
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_rename)
+        btn_row.addWidget(self.btn_set_key)
         btn_row.addWidget(self.btn_delete)
         layout.addLayout(btn_row)
 
@@ -209,10 +237,22 @@ class FieldAdjustDialog(QDialog):
         self._refresh_list()
 
     def _refresh_list(self) -> None:
-        """按工作副本重建字段列表，并刷新变更预览。"""
+        """按工作副本重建字段列表，并刷新变更预览。
+
+        列表项追加列目录语义标记：系统 / 唯一键 / 人工状态（来自
+        api_get_table_fields 返回的 is_* 标注，帮助用户识别哪些列受保护）。
+        """
         self.field_list.clear()
         for f in self._fields:
-            self.field_list.addItem(f"{f['column_name']}  ({f['data_type']})")
+            tags = []
+            if f.get("is_system_col"):
+                tags.append("系统")
+            if f.get("is_key_col"):
+                tags.append("唯一键")
+            if f.get("is_status_col"):
+                tags.append("人工状态")
+            suffix = f"  [{' / '.join(tags)}]" if tags else ""
+            self.field_list.addItem(f"{f['column_name']}  ({f['data_type']}){suffix}")
         self._refresh_ops()
 
     def _refresh_ops(self) -> None:
@@ -227,6 +267,8 @@ class FieldAdjustDialog(QDialog):
             return f"＋ 新增字段：{op[1]}  ({op[2]})"
         if op[0] == "RENAME":
             return f"⇄ 重命名：{op[1]}  →  {op[2]}"
+        if op[0] == "SETKEY":
+            return f"⇧ 设为唯一键：{op[1]}（原唯一键列自动取消该标志）"
         if op[0] == "DROP":
             return f"－ 删除字段：{op[1]}"
         return str(op)
@@ -278,6 +320,23 @@ class FieldAdjustDialog(QDialog):
         self._ops.append(("RENAME", old, new))
         self._refresh_list()
 
+    def _set_key_selected(self) -> None:
+        """把选中的字段设为唯一键（记录 SETKEY 操作，点「确定」时统一提交）。
+
+        用途：删除内置唯一键列（合同编号）前，先对另一列执行本操作移交唯一键。
+        语义由 database_serv.api_set_key_column 校验并落库（NOT NULL + 唯一索引 +
+        目录标志移交），对话框只负责记录待提交操作。
+        """
+        name = self._selected_field_name()
+        if name is None:
+            QMessageBox.information(self, "提示", "请先选择一个字段。")
+            return
+        for op in self._ops:
+            if op[0] == "SETKEY" and op[1] == name:
+                return  # 已排入队列，避免重复
+        self._ops.append(("SETKEY", name))
+        self._refresh_list()
+
     def _delete_selected(self) -> None:
         """删除选中的字段（记录 DROP 操作）。"""
         old = self._selected_field_name()
@@ -304,6 +363,8 @@ class FieldAdjustDialog(QDialog):
                 ok, msg = api_alter_table_field(self.current_user, "ADD", self.table_name, op[1], op[2])
             elif op[0] == "RENAME":
                 ok, msg = api_rename_table_field(self.current_user, self.table_name, op[1], op[2])
+            elif op[0] == "SETKEY":
+                ok, msg = api_set_key_column(self.current_user, self.table_name, op[1])
             elif op[0] == "DROP":
                 ok, msg = api_alter_table_field(self.current_user, "DROP", self.table_name, op[1])
             else:
@@ -402,6 +463,120 @@ class LedgerStatusDialog(QDialog):
         self._load()
 
 
+# ===== 用户管理窗口（仅最高管理员 admin 可打开，入口：设置 → 用户管理）=====
+class AdminUsersDialog(QDialog):
+    """最高管理员：查看全部用户状态 + 停用/启用 + 转让最高管理员。
+
+    · 权限：调用方（MainWindow）已保证本窗口只对 admin 开放；服务端
+      database_serv.api_* 内部仍会再次校验 role_type（纵深防御）；
+    · 展示字段：用户名 / 角色 / 账号状态（正常·停用）/ 最近登录 / 注册时间 /
+      是否本机当前登录；
+    · 在线状态说明：桌面单机阶段尚无服务端会话（FastAPI 阶段才落地
+      user_sessions），此处"状态"= 账号状态 + 最近登录时间；
+    · 转让成功后返回 QDialog.Accepted，主窗口据此退出登录（本人已降级）。
+    """
+
+    def __init__(self, parent, current_user: dict) -> None:
+        super().__init__(parent)
+        self.current_user = current_user
+        self.setWindowTitle("用户管理 - 最高管理员")
+        self.resize(780, 430)
+        self._rows: list[dict] = []
+        self._build_ui()
+        self._load()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("全部用户状态（账号状态 + 最近登录；真正的在线会话随 FastAPI 会话表落地）"))
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["用户名", "角色", "账号状态", "最近登录", "注册时间", "当前登录"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_toggle = QPushButton("停用 / 启用选中")
+        self.btn_toggle.clicked.connect(self._toggle_selected)
+        self.btn_transfer = QPushButton("转让最高管理员…")
+        self.btn_transfer.clicked.connect(self._transfer_admin)
+        btn_row.addWidget(self.btn_toggle)
+        btn_row.addWidget(self.btn_transfer)
+        btn_row.addStretch(1)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.clicked.connect(self._load)
+        btn_row.addWidget(self.btn_refresh)
+        layout.addLayout(btn_row)
+
+        hint = QLabel("提示：停用后该账号无法登录；转让成功后本机将退出登录（本人降为财务主管）。")
+        hint.setStyleSheet("color: #777;")
+        layout.addWidget(hint)
+
+    def _load(self) -> None:
+        ok, res = api_list_users(self.current_user)
+        if not ok:
+            QMessageBox.critical(self, "读取用户失败", str(res))
+            self._rows = []
+        else:
+            self._rows = list(res)
+        self.table.setRowCount(len(self._rows))
+        for i, row in enumerate(self._rows):
+            self.table.setItem(i, 0, QTableWidgetItem(str(row.get("username", ""))))
+            self.table.setItem(i, 1, QTableWidgetItem(_role_label(row.get("role_type", ""))))
+            self.table.setItem(i, 2, QTableWidgetItem("正常" if row.get("is_active", True) else "已停用"))
+            self.table.setItem(i, 3, QTableWidgetItem(str(row.get("last_login_at") or "从未登录")))
+            self.table.setItem(i, 4, QTableWidgetItem(str(row.get("created_at") or "")))
+            is_me = row.get("username") == self.current_user.get("username")
+            self.table.setItem(i, 5, QTableWidgetItem("● 本机" if is_me else ""))
+
+    def _selected_username(self) -> str | None:
+        idx = self.table.currentRow()
+        if idx < 0 or idx >= len(self._rows):
+            return None
+        return str(self._rows[idx].get("username", ""))
+
+    def _toggle_selected(self) -> None:
+        name = self._selected_username()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择一名用户。")
+            return
+        ok, msg = api_toggle_user_active(self.current_user, name)
+        if ok:
+            QMessageBox.information(self, "操作结果", msg)
+        else:
+            QMessageBox.warning(self, "操作失败", msg)
+        self._load()
+
+    def _transfer_admin(self) -> None:
+        name = self._selected_username()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择接收最高管理员的用户。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认转让",
+            f"确定把最高管理员转让给「{name}」？\n"
+            "转让后您将降为财务主管并退出登录，需使用新账号重新登录。",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        pwd, ok_in = QInputDialog.getText(
+            self, "密码确认", "请输入您的登录密码以确认转让：", QLineEdit.EchoMode.Password
+        )
+        if not (ok_in and pwd):
+            return
+        ok, msg = api_transfer_admin(self.current_user, name, pwd)
+        if ok:
+            QMessageBox.information(self, "转让成功", msg)
+            self.accept()  # 通知主窗口：退出登录
+        else:
+            QMessageBox.warning(self, "转让失败", msg)
+
+
 @dataclass
 class TaskRecord:
     file_path: Path
@@ -445,6 +620,9 @@ class ScanWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    # 请求退出登录（回到登录对话框）。注销账户/转让最高管理员/主动退出时发出，
+    # 由 main() 的"登录-主窗口"循环接管回到登录框。
+    logout_requested = Signal()
 
     def __init__(self, current_user: dict) -> None:
         super().__init__()
@@ -459,6 +637,7 @@ class MainWindow(QMainWindow):
         self._current_worker: ScanWorker | None = None
 
         self._build_ui()
+        self._build_top_right_menu()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -805,6 +984,91 @@ class MainWindow(QMainWindow):
         else:
             self.preview.setPlainText(f"{file_path}\n\n状态：{record.status}")
 
+    # ===== 右上角设置菜单：登录信息 / 退出登录 / 注销账户 / 用户管理 =====
+    def _build_top_right_menu(self) -> None:
+        """主窗口右上角"设置"菜单（QMenuBar 右上角挂件）。
+
+        · 「用户管理」仅最高管理员可见；
+        · 服务端（database_serv）负责全部权限与约束校验，UI 只做调用与提示。
+        """
+        menu = QMenu(self)
+        act_info = menu.addAction("查看登录信息")
+        act_info.triggered.connect(self._show_user_info)
+        menu.addSeparator()
+        if (self.current_user or {}).get("role_type") == "admin":
+            act_manage = menu.addAction("用户管理（最高管理员）")
+            act_manage.triggered.connect(self._open_admin_users)
+            menu.addSeparator()
+        act_logout = menu.addAction("退出登录")
+        act_logout.triggered.connect(self._logout)
+        act_deactivate = menu.addAction("注销账户…")
+        act_deactivate.triggered.connect(self._deactivate_account)
+
+        self._settings_button = QPushButton("⚙ 设置")
+        self._settings_button.setMenu(menu)
+        self._settings_button.setFlat(True)
+        self._settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menuBar().setCornerWidget(self._settings_button, Qt.Corner.TopRightCorner)
+
+    def _show_user_info(self) -> None:
+        """设置 → 查看登录信息：展示当前登录用户资料。"""
+        u = self.current_user or {}
+        role = _role_label(u.get("role_type", ""))
+        lines = [
+            f"用户名：{u.get('username', '')}",
+            f"角色：{role}",
+            f"账号状态：{'正常' if u.get('is_active', True) else '已停用'}",
+            f"最近登录：{u.get('last_login_at') or '本次（首次记录）'}",
+        ]
+        if u.get("role_type") == "admin":
+            lines.append("")
+            lines.append("您是最高管理员，可在「设置 → 用户管理」中查看/停用/转让。")
+        QMessageBox.information(self, "登录信息", "\n".join(lines))
+
+    def _logout(self) -> None:
+        """退出登录：回到登录对话框（由 main() 的登录循环接管）。"""
+        self.logout_requested.emit()
+        self.close()
+
+    def _deactivate_account(self) -> None:
+        """设置 → 注销账户：软停用当前账号（最高管理员须先转让，服务端强制）。"""
+        u = self.current_user or {}
+        if u.get("role_type") == "admin":
+            QMessageBox.warning(
+                self,
+                "无法注销",
+                "最高管理员不能直接注销账号。\n"
+                "请先通过「设置 → 用户管理 → 转让最高管理员」把管理权转交他人，"
+                "再用新账号登录后注销本账号。",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认注销",
+            "确定注销当前账号吗？\n注销后该账号将无法登录（如误操作，可由最高管理员在"
+            "「用户管理」中重新启用）。",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        pwd, ok_in = QInputDialog.getText(
+            self, "密码确认", "请输入您的登录密码以确认注销：", QLineEdit.EchoMode.Password
+        )
+        if not (ok_in and pwd):
+            return
+        ok, msg = api_deactivate_self(self.current_user, pwd)
+        if ok:
+            QMessageBox.information(self, "注销成功", msg)
+            self._logout()
+        else:
+            QMessageBox.warning(self, "注销失败", msg)
+
+    def _open_admin_users(self) -> None:
+        """设置 → 用户管理（仅 admin）：转让成功后本机退出登录。"""
+        dialog = AdminUsersDialog(self, self.current_user)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 转让成功且本机用户已降级 → 退出登录（转让结果提示已在窗口内展示）
+            self._logout()
+
 
 def main() -> int:
     app = QApplication(sys.argv)
@@ -844,19 +1108,36 @@ def main() -> int:
         QMessageBox.critical(None, "数据库初始化失败", f"错误详情:\n{db_result[0][1]}")
         return 1
 
-    # 弹出登录拦截
-    login_dialog = LoginRegisterDialog()
-    if login_dialog.exec() != QDialog.DialogCode.Accepted:
-        return 0
-
-    window = MainWindow(current_user=login_dialog.user_info)
-    window.show()
-
-    window.raise_()
-    window.activateWindow()
-
+    # ===== 登录 / 主窗口循环 =====
+    # 支持「退出登录/注销账户/转让最高管理员」后回到登录对话框重新登录；
+    # 关闭登录框或直接关闭主窗口（未触发退出登录）则结束程序。
     print("Qt event loop starting...")
-    return app.exec()
+    exit_to_login = {"flag": False}  # 主窗口是否以"退出登录"方式关闭
+
+    while True:
+        login_dialog = LoginRegisterDialog()
+        if login_dialog.exec() != QDialog.DialogCode.Accepted:
+            return 0  # 关闭登录框 = 退出程序
+
+        window = MainWindow(current_user=login_dialog.user_info)
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+        def _on_logout_requested() -> None:
+            exit_to_login["flag"] = True
+
+        window.logout_requested.connect(_on_logout_requested)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+        win_loop = QEventLoop()
+        window.destroyed.connect(win_loop.quit)
+        win_loop.exec()  # 主窗口关闭（点 X / 退出登录）即结束本轮
+
+        if exit_to_login["flag"]:
+            exit_to_login["flag"] = False
+            continue  # 回到登录对话框
+        return 0
 
 
 if __name__ == "__main__":

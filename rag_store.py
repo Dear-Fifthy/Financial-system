@@ -48,7 +48,10 @@ def _env_int(name: str, default: int) -> int:
 RAG_EMBED_BACKEND = os.getenv("RAG_EMBED_BACKEND", "local").strip().lower()
 RAG_EMBED_DIM = _env_int("RAG_EMBED_DIM", 512)      # bge-small-zh = 512；必须与模型一致
 RAG_CHUNK_SIZE = _env_int("RAG_CHUNK_SIZE", 700)    # 单块目标字符数（中文约 1 字≈1 token）
-RAG_OVERLAP = _env_int("RAG_OVERLAP", 100)          # 相邻块重叠字符数
+RAG_OVERLAP = _env_int("RAG_OVERLAP", 100)           # 相邻块重叠字符数
+# 切分点浮动窗口(字符)：±该范围内找干净落点（行首/空白/标点），
+# 保护 text:/paragraph_title: 等英文格式标签的完整性
+RAG_BOUNDARY_FLOAT_CHARS = _env_int("RAG_BOUNDARY_FLOAT_CHARS", 20)
 RAG_EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
 RAG_EMBED_API_URL = os.getenv("RAG_EMBED_API_URL", "")
 RAG_EMBED_API_KEY = os.getenv("RAG_EMBED_API_KEY", "")
@@ -60,65 +63,110 @@ RAG_EMBED_TIMEOUT_S = _env_int("RAG_EMBED_TIMEOUT_S", 1800)
 # =========================================================
 # 1. 分块（chunking）
 # =========================================================
-_HEADING_RE = re.compile(r"^(?:##|paragraph_title:)\s*(.*)$", re.MULTILINE)
+# hub 文本里的"英文格式描述前缀"：切分必须保证这些标签行完整，不腰斩
+_LABEL_PREFIXES = ("text:", "header:", "doc_title:", "paragraph_title:", "number:", "table:", "seal:")
+# 归一化用：标签出现在行中（前面不是行首/字母数字）时，在其前补换行拆成独立行——
+# 修复 OCR 把多个块并成一行导致的 "…协助；text:由乙方承担…" 粘连
+_LABEL_JOIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_\n])(?=(?:text|header|doc_title|paragraph_title|number|table|seal):)"
+)
 
 
-def chunk_document(full_text: str, chunk_size: int = RAG_CHUNK_SIZE, overlap: int = RAG_OVERLAP) -> list[str]:
+def _is_label_line(line: str) -> bool:
+    """该行是否是格式标签/标题行（行首切分时的"干净边界"）。"""
+    s = line.lstrip()
+    return s.startswith("##") or any(s.startswith(p) for p in _LABEL_PREFIXES)
+
+
+def _split_long_line(line: str, size: int, float_chars: int) -> list[str]:
+    """单行超过块长时做行内切分：切点在 ±float_chars 内浮动到最近的
+    空白/中英文标点之后，避免把 text:/paragraph_title: 等 ASCII 标签或
+    词语从中间切断；整行没有可用断点时按 size 硬切（保底）。"""
+    parts: list[str] = []
+    rest = line
+    while len(rest) > size:
+        lo = max(0, size - float_chars)
+        hi = min(len(rest), size + float_chars)
+        best = size
+        for off in range(lo, hi):
+            if rest[off] in " \t，,。；;：:":
+                if abs(off - size) < abs(best - size):
+                    best = off
+        parts.append(rest[:best])
+        rest = rest[best:]
+    if rest:
+        parts.append(rest)
+    return parts
+
+
+def chunk_document(
+    full_text: str,
+    chunk_size: int = RAG_CHUNK_SIZE,
+    overlap: int = RAG_OVERLAP,
+    float_chars: int = RAG_BOUNDARY_FLOAT_CHARS,
+) -> list[str]:
     """把文档文本切成检索块。
 
-    策略（按"最合适"标准选择）：
-      1. 优先按语义标题切分：识别 "## " / "paragraph_title:" 开头的行作为自然边界；
-      2. 标题块过短的相邻合并，避免碎片化；
-      3. 超长段落按固定窗口 + 重叠兜底，避免切断语义；
+    规则（对应讨论结论）：
+      1. 只在【行首】切分——hub 文本每行形如 "text:…"/"paragraph_title:…"，
+         行首切分保证英文格式描述（text:/paragraph_title:/doc_title:/header:/
+         number:/table:/seal:）永远完整，不会被拦腰切断；
+      2. 切分点容许浮动（±float_chars≈10-20 字符）：块超限时不立刻切，
+         先看是否属于"超长单行"——是则行内切，切点浮动到最近的空白/标点后；
+         普通多行块则在上限边界处自然落在行首（浮动范围即"最后一行"的粒度）；
+      3. 重叠：每块开头拼接上一块末尾 overlap（默认 20，10-20 左右）字符，
+         供跨块上下文衔接（标点/句意不被割裂）；
       4. 中文按字符数估算（1 字 ≈ 1 token），chunk_size 留安全余量。
     返回按原文档顺序排列的块列表。
     """
     text = (full_text or "").strip()
     if not text:
         return []
+    # 归一化：行中粘连的格式标签拆成独立行（修复 "…协助；text:由乙方承担…"）
+    text = _LABEL_JOIN_RE.sub("\n", text)
+    lines = text.splitlines()
+    if not lines:
+        return []
 
-    # 1) 按标题切出"自然段落"（保留标题行在段首）
-    segments: list[str] = []
-    last = 0
-    for m in _HEADING_RE.finditer(text):
-        if m.start() > last:
-            segments.append(text[last : m.start()].strip())
-        last = m.start()
-    if last < len(text):
-        segments.append(text[last:].strip())
-    segments = [s for s in segments if s]
+    # ---- 第一步：按行累积成"候选块"（只在行首切）----
+    raw_chunks: list[str] = []
+    buf: list[str] = []
+    buf_chars = 0
 
-    # 2) 合并过短段 + 切分超长段
+    def flush() -> None:
+        nonlocal buf, buf_chars
+        if buf:
+            raw_chunks.append("\n".join(buf))
+        buf, buf_chars = [], 0
+
+    for line in lines:
+        line_cost = len(line) + 1  # +1 近似换行
+        if buf and buf_chars + line_cost > chunk_size:
+            flush()  # 超限 → 在行首切一刀（天然干净边界）
+        if len(line) > chunk_size:
+            # 超长单行：行内浮动切分（保护标签/词不被腰斩）
+            for seg in _split_long_line(line, chunk_size, float_chars):
+                flush()
+                buf.append(seg)
+                buf_chars = len(seg)
+            flush()
+        else:
+            buf.append(line)
+            buf_chars += line_cost
+    flush()
+
+    # ---- 第二步：加重叠（每块开头补上一块末尾 overlap 字符）----
+    # 接缝处补换行：避免"上一块尾部文字 + 下一块行首标签"在拼接处粘成一行
     chunks: list[str] = []
-    buffer = ""
-    for seg in segments:
-        if len(seg) < 60:  # 短片段（标题残留/页眉）并入前一块
-            buffer = (buffer + "\n" + seg).strip()
-            continue
-        if buffer:
-            chunks.append(buffer)
-            buffer = ""
-        if len(seg) <= chunk_size:
-            chunks.append(seg)
+    prev_tail = ""
+    for c in raw_chunks:
+        if overlap > 0 and prev_tail and c:
+            seam = "\n" if not prev_tail.endswith("\n") else ""
+            chunks.append(prev_tail + seam + c)
         else:
-            # 固定窗口 + 重叠兜底
-            step = chunk_size - overlap
-            start = 0
-            while start < len(seg):
-                chunks.append(seg[start : start + chunk_size])
-                start += step
-    if buffer:
-        chunks.append(buffer)
-
-    # 3) 收尾：块太长（理论上不会）就再切一刀
-    final: list[str] = []
-    for c in chunks:
-        if len(c) <= chunk_size:
-            final.append(c)
-        else:
-            step = chunk_size - overlap
-            final.extend(c[i : i + chunk_size] for i in range(0, len(c), step))
-    return [c for c in final if c.strip()]
+            chunks.append(c)
+        prev_tail = c[-overlap:] if overlap and c else ""
+    return [c for c in chunks if c.strip()]
 
 
 # =========================================================

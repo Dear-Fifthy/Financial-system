@@ -4,7 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import uuid
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from cryptography.fernet import Fernet
 
@@ -149,32 +151,218 @@ def register_user(username: str, password: str, email: str, phone: str) -> tuple
     if not re.match(phone_regex, phone):
         return False, "手机号码格式不正确（需为11位大陆手机号）！"
 
+    first_admin = False  # 本次注册是否以"首个 admin"身份创建（供 except 分支安全引用）
+
     try:
         # 使用 finance_app_role 连接并执行 INSERT 提交
         with get_connection() as conn, conn.cursor() as cur:
+            # 首个注册用户 = 最高管理员（admin）：仅当库中尚无人拥有 admin 角色时生效
+            #（新装空库场景；并发竞态由 uq_sys_users_single_admin 部分唯一索引兜底，
+            #  见 init_db.sql——同一时刻只允许一个 admin，失败者自动降级重试）。
+            cur.execute("SELECT 1 FROM sys_users WHERE role_type = 'admin' LIMIT 1")
+            first_admin = cur.fetchone() is None
+            role = "admin" if first_admin else "finance_staff"
             cur.execute(
-                "INSERT INTO sys_users (username, password_hash, email, phone) VALUES (%s, %s, %s, %s)",
-                (username, hash_pwd(password), email, phone),
+                "INSERT INTO sys_users (username, password_hash, email, phone, role_type) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (username, hash_pwd(password), email, phone, role),
             )
             conn.commit()  # 提交事务
+            if first_admin:
+                return True, "注册成功（首个用户已自动成为最高管理员 admin）！"
             return True, "注册成功！"
     except Exception as exc:
+        # 并发"首个注册"竞态：两人同时通过"无 admin"检查，唯一索引只放行一人；
+        # 冲突者以普通角色（finance_staff）自动重试一次。
+        from psycopg2 import errors as _pg_errors
+
+        if first_admin and isinstance(exc, _pg_errors.UniqueViolation):
+            try:
+                with get_connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO sys_users (username, password_hash, email, phone, role_type) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (username, hash_pwd(password), email, phone, "finance_staff"),
+                    )
+                    conn.commit()
+                return True, "注册成功！"
+            except Exception as exc2:
+                return False, f"注册失败: {exc2}"
         return False, f"注册失败: {exc}"
 
 def authenticate_user(username: str, password: str) -> tuple[bool, dict | str]:
-    """用户登录验证。"""
+    """用户登录验证。
+
+    校验通过后刷新 last_login_at（供"用户管理"界面显示最近登录）。
+    账号被停用（is_active=FALSE，注销账户/管理员停用）时拒绝登录并给出明确提示。
+    """
     try:
         with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                "SELECT user_id, username, role_type FROM sys_users WHERE username = %s AND password_hash = %s",
+                "SELECT user_id, username, role_type, is_active, last_login_at "
+                "FROM sys_users WHERE username = %s AND password_hash = %s",
                 (username, hash_pwd(password)),
             )
             user = cur.fetchone()
             if user:
+                if not user["is_active"]:
+                    return False, "账号已被停用，请联系最高管理员！"
+                cur.execute(
+                    "UPDATE sys_users SET last_login_at = NOW() WHERE user_id = %s",
+                    (user["user_id"],),
+                )
+                conn.commit()
                 return True, dict(user)
             return False, "用户名或密码错误！"
     except Exception as exc:
         return False, f"数据库连接异常: {exc}"
+
+
+# =========================================================
+# 4.5 用户与最高管理员管理 API（桌面端"用户管理"界面用）
+# ---------------------------------------------------------
+# 说明：FastAPI 阶段引入服务端会话后，这里的部分逻辑（在线状态/吊销会话）会
+# 迁移到 user_sessions；当前桌面单机阶段的"用户状态"= 账号状态(正常/停用) +
+# 最近登录时间 + 是否本机当前登录。
+# 约束（服务端强制，UI 只负责展示与调用）：
+#   · admin 单例（uq_sys_users_single_admin 索引）；
+#   · 最高管理员不能直接注销/停用自己——必须先转让；
+#   · 转让在同一事务内 旧主降级(financial_role) -> 新主提升(admin)；
+#   · 注销/转让需本人密码二次确认。
+# =========================================================
+def _require_admin(user: dict | None) -> tuple[bool, str]:
+    """仅最高管理员（admin）可执行操作的前置检查。"""
+    if not user:
+        return False, "未登录，无法执行该操作！"
+    if user.get("role_type") != "admin":
+        return False, "该操作仅最高管理员（admin）可执行！"
+    return True, ""
+
+
+def _verify_user_password(username: str, password: str) -> bool:
+    """校验某用户密码是否正确（注销/转让的二次确认用）。"""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM sys_users WHERE username = %s AND password_hash = %s",
+            (username, hash_pwd(password)),
+        )
+        return cur.fetchone() is not None
+
+
+def api_list_users(user: dict | None) -> tuple[bool, list[dict] | str]:
+    """最高管理员：列出全部用户（不含密码哈希）。
+
+    每行：user_id/username/role_type/is_active/last_login_at/created_at。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    try:
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT user_id, username, role_type, is_active, last_login_at, created_at "
+                "FROM sys_users ORDER BY user_id"
+            )
+            return True, [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        return False, f"读取用户列表失败: {exc}"
+
+
+def api_toggle_user_active(user: dict | None, target_username: str) -> tuple[bool, str]:
+    """最高管理员：停用/启用指定账号（软停用，不删行）。
+
+    约束：不能停用自己（最高管理员必须先转让才能交权）。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    if not target_username or target_username == user.get("username"):
+        return False, "不能停用当前登录的最高管理员账号；如需交权请先「转让最高管理员」！"
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_active FROM sys_users WHERE username = %s", (target_username,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, f"用户「{target_username}」不存在！"
+            new_val = not row[0]
+            cur.execute(
+                "UPDATE sys_users SET is_active = %s WHERE username = %s",
+                (new_val, target_username),
+            )
+            conn.commit()
+            action = "启用" if new_val else "停用"
+            return True, f"已{action}用户「{target_username}」！"
+    except Exception as exc:
+        return False, f"操作失败: {exc}"
+
+
+def api_transfer_admin(
+    user: dict | None, target_username: str, password: str
+) -> tuple[bool, str]:
+    """最高管理员转让（原子事务）：目标升为 admin，本人降为 financial_role。
+
+    校验：本人确为 admin；目标存在、已启用、非本人、非 admin；
+    需输入本人密码二次确认。成功后调用方（桌面端）应退出登录。
+    事务顺序：先本人降级（admin 数 → 0）再目标升级（→1），全程满足单例索引。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    if not target_username or target_username == user.get("username"):
+        return False, "不能转让给自己！请选择另一名用户。"
+    if not _verify_user_password(user.get("username", ""), password):
+        return False, "密码错误，转让已取消！"
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT role_type, is_active FROM sys_users WHERE username = %s",
+                (target_username,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, f"用户「{target_username}」不存在！"
+            if row[0] == "admin":
+                return False, f"「{target_username}」已是最高管理员，无需转让！"
+            if not row[1]:
+                return False, f"「{target_username}」已被停用，请先启用再转让！"
+            # 顺序：旧主降级 -> 新主提升（单例索引全程约束 ≤1 个 admin）
+            cur.execute(
+                "UPDATE sys_users SET role_type = 'financial_role' WHERE user_id = %s",
+                (user["user_id"],),
+            )
+            cur.execute(
+                "UPDATE sys_users SET role_type = 'admin' WHERE username = %s",
+                (target_username,),
+            )
+            conn.commit()
+            return True, f"最高管理员已转让给「{target_username}」，请重新登录！"
+    except Exception as exc:
+        return False, f"转让失败: {exc}"
+
+
+def api_deactivate_self(user: dict | None, password: str) -> tuple[bool, str]:
+    """当前用户注销自己的账号（软停用，is_active=FALSE）。
+
+    最高管理员不可直接注销——必须先通过 api_transfer_admin 转让最高管理员。
+    """
+    if not user:
+        return False, "未登录，无法执行该操作！"
+    username = user.get("username", "")
+    if user.get("role_type") == "admin":
+        return False, "最高管理员不能直接注销账号；请先转让最高管理员后再注销！"
+    if not _verify_user_password(username, password):
+        return False, "密码错误，注销已取消！"
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sys_users SET is_active = FALSE WHERE username = %s", (username,)
+            )
+            conn.commit()
+            return True, "账号已注销（停用）。如误操作请联系最高管理员启用。"
+    except Exception as exc:
+        return False, f"注销失败: {exc}"
 
 
 # ===== 2. AI 识别合同数据写入 API =====
@@ -347,6 +535,213 @@ ALLOWED_COLUMN_TYPES = {
 }
 
 
+# =========================================================
+# 4.0 列目录表 column_catalog（物理列 = 唯一事实源，目录只做语义标注）
+# =========================================================
+# 背景：字段调整对话框要允许"内置列可删/可改"（内置列只是初始化一次），
+# 但代码需要知道每列的语义（哪个是唯一键/人工状态/系统列，AI 是否可见）。
+# 因此引入列目录表 column_catalog：
+#   · logical_key：英文稳定逻辑键（如 contract_code），只在程序内部/本表使用，
+#     永不作为物理列名；物理列名永远是中文，以 information_schema 为准；
+#   · 自愈对账：目录行不随 ALTER 事务绑定删除——物理列是唯一事实源。
+#     load_column_catalog() 每次读取前自动比对：
+#       目录有、物理无 → 删行（列被 DROP 或外部删除）；
+#       物理有、目录无 → 补行（命中种子名按种子语义，否则按通用自定义列）。
+#     因此"删除列 = 纯 ALTER TABLE DROP COLUMN"，无需手工删目录行，
+#     也保证交给 AI/对话框的列清单永远与物理列一一对应、不多不少。
+#   · 种子让位：种子列若已被用户删除，对账时不会悄悄重建（不复活已删列）。
+# 权限：目录表由管理员连接创建并授权给应用角色；日常读取走应用连接。
+# ⚠️ 已知局限（文档化）：绕过本应用（如 pgAdmin）直接改名/删列时，
+#    目录无法自动推断语义迁移，只会按"删旧列 + 新增通用列"处理；
+#    本应用内的改名/删除必须走下方 api_rename_table_field /
+#    api_alter_table_field / api_set_key_column（会同步目录）。
+_CATALOG_DDL = """
+CREATE TABLE IF NOT EXISTS column_catalog (
+    catalog_id    SERIAL PRIMARY KEY,
+    table_name    VARCHAR(64)  NOT NULL,
+    logical_key   VARCHAR(64)  NOT NULL,
+    col_name      VARCHAR(64)  NOT NULL,
+    data_type     VARCHAR(32)  NOT NULL,
+    is_key_col    BOOLEAN NOT NULL DEFAULT FALSE,
+    is_status_col BOOLEAN NOT NULL DEFAULT FALSE,
+    is_system_col BOOLEAN NOT NULL DEFAULT FALSE,
+    ai_visible    BOOLEAN NOT NULL DEFAULT TRUE,
+    history_feed  BOOLEAN NOT NULL DEFAULT FALSE,
+    is_seed       BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order    INT NOT NULL DEFAULT 0,
+    UNIQUE (table_name, col_name),
+    UNIQUE (table_name, logical_key)
+);
+"""
+
+# 种子列语义（col_name = 建表时的初始中文列名；对账发现物理列存在且目录缺失时回填）。
+# is_key_col    = 唯一键列（台账覆盖/去重依据），当前只有合同编号；
+# is_status_col = 人工状态列（是否已收款/是否已开票，只允许人工切换，AI 不得写）；
+# is_system_col = 系统列（id/创建时间），禁止删除/改名；
+# ai_visible    = 是否允许 AI 读写（标志先随种子落库，供后续"AI 提示词动态列"阶段启用，
+#                 当前 AI/台账代码仍按旧逻辑运行，本阶段不改其行为）；
+# history_feed  = 是否进 AI 的历史（项目+备注）上下文。
+_SEED_COLUMNS = [
+    {"logical_key": "contract_code", "col_name": "合同编号", "data_type": "VARCHAR(100)",
+     "is_key_col": True, "ai_visible": False},
+    {"logical_key": "party_a", "col_name": "甲方", "data_type": "VARCHAR(200)", "ai_visible": True},
+    {"logical_key": "income", "col_name": "合同金额", "data_type": "NUMERIC(15,2)", "ai_visible": True},
+    {"logical_key": "contract_term", "col_name": "合同期限", "data_type": "VARCHAR(50)", "ai_visible": True},
+    {"logical_key": "project", "col_name": "项目", "data_type": "VARCHAR(200)",
+     "ai_visible": True, "history_feed": True},
+    {"logical_key": "is_paid", "col_name": "是否已收款", "data_type": "BOOLEAN",
+     "is_status_col": True, "ai_visible": False},
+    {"logical_key": "is_invoiced", "col_name": "是否已开票", "data_type": "BOOLEAN",
+     "is_status_col": True, "ai_visible": False},
+    {"logical_key": "remark", "col_name": "备注", "data_type": "TEXT",
+     "ai_visible": True, "history_feed": True},
+    {"logical_key": "sys_id", "col_name": "id", "data_type": "BIGSERIAL",
+     "is_system_col": True, "ai_visible": False},
+    {"logical_key": "sys_created", "col_name": "创建时间", "data_type": "TIMESTAMP",
+     "is_system_col": True, "ai_visible": False},
+]
+_SEED_BY_COL = {s["col_name"]: s for s in _SEED_COLUMNS}
+
+# 兜底保护：即使目录表初始化失败，系统列也不允许被删/改名（按名字硬保护）。
+_SYSTEM_COLUMN_FALLBACK = {"id", "创建时间"}
+
+
+def _ensure_catalog_table() -> None:
+    """确保 column_catalog 表存在并授权（管理员连接，幂等）。"""
+    with get_admin_connection() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(_CATALOG_DDL)
+            cur.execute(
+                sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON {} TO {}").format(
+                    sql.Identifier("column_catalog"),
+                    sql.Identifier(APP_DB_CONFIG["user"]),
+                )
+            )
+            cur.execute(
+                sql.SQL("GRANT USAGE, SELECT ON SEQUENCE {} TO {}").format(
+                    sql.Identifier("column_catalog_catalog_id_seq"),
+                    sql.Identifier(APP_DB_CONFIG["user"]),
+                )
+            )
+
+
+def _read_catalog_rows(table_name: str) -> list[dict]:
+    """读取目录全部行（应用连接；表不存在/无权限时抛异常，由调用方处理）。"""
+    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT catalog_id, logical_key, col_name, data_type, is_key_col, "
+            "is_status_col, is_system_col, ai_visible, history_feed, is_seed, sort_order "
+            "FROM column_catalog WHERE table_name = %s "
+            "ORDER BY sort_order, catalog_id",
+            (table_name,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _physical_column_names(table_name: str) -> set[str]:
+    """读取业务表当前真实存在的物理列名（information_schema，应用连接）。"""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
+            (table_name,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def _write_catalog_reconcile(table_name: str, physical: set[str]) -> list[dict]:
+    """对账修正（管理员连接）：删掉已不存在的目录行，补上物理新增列。
+
+    物理有、目录无的列，补行规则：
+      - 命中种子名 且 该逻辑键未被占用 → 按种子语义补（唯一键/状态/系统标志保留）；
+      - 否则 → 通用自定义列（logical_key 自动生成 c_xxxx，ai_visible=True）。
+    返回修正后的目录行。
+    """
+    with get_admin_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT catalog_id, logical_key, col_name FROM column_catalog "
+            "WHERE table_name = %s",
+            (table_name,),
+        )
+        existing = cur.fetchall()
+        # 1) 目录有、物理无 → 删行
+        for cid, _lk, zh in existing:
+            if zh not in physical:
+                cur.execute("DELETE FROM column_catalog WHERE catalog_id = %s", (cid,))
+        # 2) 物理有、目录无 → 补行
+        known = {zh for _cid, _lk, zh in existing}
+        used_keys = {lk for _cid, lk, _zh in existing}
+        cur.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM column_catalog WHERE table_name = %s",
+            (table_name,),
+        )
+        next_order = cur.fetchone()[0]
+        for zh in sorted(physical - known):
+            next_order += 1
+            seed = _SEED_BY_COL.get(zh)
+            if seed is not None and seed["logical_key"] not in used_keys:
+                s = seed
+                cur.execute(
+                    "INSERT INTO column_catalog (table_name, logical_key, col_name, data_type, "
+                    "is_key_col, is_status_col, is_system_col, ai_visible, history_feed, "
+                    "is_seed, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (table_name, col_name) DO NOTHING",
+                    (table_name, s["logical_key"], zh, s["data_type"],
+                     s.get("is_key_col", False), s.get("is_status_col", False),
+                     s.get("is_system_col", False), s.get("ai_visible", True),
+                     s.get("history_feed", False), True, next_order),
+                )
+            else:
+                # 通用自定义列：逻辑键自动生成（不可猜测、唯一、与中文名解耦）
+                cur.execute(
+                    "INSERT INTO column_catalog (table_name, logical_key, col_name, data_type, "
+                    "ai_visible, is_seed, sort_order) VALUES (%s,%s,%s,%s,TRUE,FALSE,%s) "
+                    "ON CONFLICT (table_name, col_name) DO NOTHING",
+                    (table_name, f"c_{uuid.uuid4().hex[:8]}", zh, "TEXT", next_order),
+                )
+        conn.commit()
+    return _read_catalog_rows(table_name)
+
+
+def load_column_catalog(table_name: str = "contract_projects") -> list[dict]:
+    """读取业务表的列目录（语义标注清单），读取前自动确保表存在并对账自愈。
+
+    返回每行含：catalog_id/logical_key/col_name/data_type/is_key_col/
+    is_status_col/is_system_col/ai_visible/history_feed/is_seed/sort_order。
+    任何一步失败都不抛错：打印告警并返回 []（调用方需容忍空目录，
+    系统列保护由 _SYSTEM_COLUMN_FALLBACK 名称兜底）。
+    """
+    # 首次运行（表不存在）时建表 + 授权
+    try:
+        rows = _read_catalog_rows(table_name)
+    except Exception:
+        try:
+            _ensure_catalog_table()
+            rows = _read_catalog_rows(table_name)
+        except Exception as exc:
+            print(f"⚠️ [column_catalog] 目录表初始化失败，字段保护降级为名称兜底：{exc}")
+            return []
+    # 对账：目录行集 != 物理列集 时才走管理员连接修正
+    try:
+        physical = _physical_column_names(table_name)
+    except Exception as exc:
+        print(f"⚠️ [column_catalog] 读取物理列失败（返回现有目录行）：{exc}")
+        return rows
+    known = {r["col_name"] for r in rows}
+    if known != physical:
+        try:
+            rows = _write_catalog_reconcile(table_name, physical)
+        except Exception as exc:
+            print(f"⚠️ [column_catalog] 对账修正失败（不影响主流程）：{exc}")
+    return rows
+
+
+def _catalog_by_col(table_name: str) -> dict[str, dict]:
+    """col_name -> 目录行 的便捷映射（用于字段 API 的语义判断）。"""
+    return {r["col_name"]: r for r in load_column_catalog(table_name)}
+
+
 def api_get_table_fields(user: dict | None, table_name: str = "contract_projects") -> tuple[bool, list[dict] | str]:
     """读取指定业务表的现有字段（仅字段名/类型/是否可空，不返回任何数据内容）。
 
@@ -373,7 +768,19 @@ def api_get_table_fields(user: dict | None, table_name: str = "contract_projects
                 (table_name,),
             )
             fields = [dict(row) for row in cur.fetchall()]
-            return True, fields
+        # 附加列目录语义标注（只加键、不改原有三个键，兼容现有全部调用方）：
+        # logical_key / is_key_col / is_status_col / is_system_col / is_seed / ai_visible。
+        # 目录读取失败时返回原始字段结构（与旧版行为完全一致）。
+        catalog = _catalog_by_col(table_name)
+        for f in fields:
+            meta = catalog.get(f["column_name"])
+            f["logical_key"] = (meta or {}).get("logical_key")
+            f["is_key_col"] = bool(meta and meta.get("is_key_col"))
+            f["is_status_col"] = bool(meta and meta.get("is_status_col"))
+            f["is_system_col"] = bool(meta and meta.get("is_system_col"))
+            f["is_seed"] = bool(meta and meta.get("is_seed"))
+            f["ai_visible"] = True if not meta else bool(meta.get("ai_visible", True))
+        return True, fields
     except Exception as exc:
         return False, f"读取字段失败: {exc}"
 
@@ -389,6 +796,15 @@ def api_alter_table_field(
     由表属主执行，finance_app_role 应用角色没有 DDL 权限。
     字段名支持中英文+数字+下划线；表名必须命中 ALLOWED_TABLES 白名单；
     新增时 col_type 必须命中 ALLOWED_COLUMN_TYPES 白名单。
+
+    列目录化后的语义（v2）：
+      · ADD：ALTER 后立即在 column_catalog 登记一行（逻辑键自动生成 c_xxxx、
+        类型=白名单原值、ai_visible=True）——新列下次打开字段对话框/AI 提示词
+        即可见；
+      · DROP：只执行 ALTER TABLE DROP COLUMN，**不**手工删目录行——目录行由
+        下次 load_column_catalog() 对账时自动清理（物理列是唯一事实源）。
+        保护规则：系统列（id/创建时间）不可删；当前唯一键列不可直接删，
+        需先用 api_set_key_column() 把唯一键移交给其它列。
     返回：(是否成功, 提示信息)。
     """
     ok, msg = require_permission(user, FIELD_WRITE_PERMISSION)
@@ -400,33 +816,59 @@ def api_alter_table_field(
     if not re.match(r"^[\w\u4e00-\u9fa5]+$", col_name):
         return False, "字段名只能包含中英文、数字和下划线！"
 
+    action = action_type.upper()
+    if action == "ADD":
+        if col_type.upper() not in ALLOWED_COLUMN_TYPES:
+            return False, f"不支持的字段类型：{col_type}（仅支持：{', '.join(sorted(ALLOWED_COLUMN_TYPES))}）"
+    elif action == "DROP":
+        # 删除前的语义保护（目录读取失败时用系统列名字兜底）
+        meta = _catalog_by_col(table_name).get(col_name) or {}
+        is_system = bool(meta.get("is_system_col")) or col_name in _SYSTEM_COLUMN_FALLBACK
+        is_key = bool(meta.get("is_key_col"))
+        if is_system:
+            return False, f"「{col_name}」是系统列（id/创建时间），不可删除！"
+        if is_key:
+            return False, (
+                f"「{col_name}」是当前唯一键列（台账覆盖/去重依据）。"
+                "如需删除，请先在字段列表中选择另一列点击「设为唯一键」移交后再删除。"
+            )
+    else:
+        return False, "未知的修改类型！"
+
     try:
         with get_admin_connection() as conn, conn.cursor() as cur:
             quoted_col = f'"{col_name}"'
-            if action_type.upper() == "ADD":
-                if col_type.upper() not in ALLOWED_COLUMN_TYPES:
-                    return False, f"不支持的字段类型：{col_type}（仅支持：{', '.join(sorted(ALLOWED_COLUMN_TYPES))}）"
-                sql = f"ALTER TABLE {table_name} ADD COLUMN {quoted_col} {col_type};"
-            elif action_type.upper() == "DROP":
-                sql = f"ALTER TABLE {table_name} DROP COLUMN {quoted_col};"
-            else:
-                return False, "未知的修改类型！"
-
-            cur.execute(sql)
+            if action == "ADD":
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {quoted_col} {col_type};")
+                # 同步登记目录行：逻辑键自动生成，类型用白名单原值（便于后续 AI 类型提示）
+                cur.execute(
+                    "INSERT INTO column_catalog (table_name, logical_key, col_name, data_type, "
+                    "ai_visible, is_seed) VALUES (%s, %s, %s, %s, TRUE, FALSE) "
+                    "ON CONFLICT (table_name, col_name) DO NOTHING",
+                    (table_name, f"c_{uuid.uuid4().hex[:8]}", col_name, col_type),
+                )
+            else:  # DROP：纯 DDL，目录行由下次 load_column_catalog() 对账清理
+                cur.execute(f"ALTER TABLE {table_name} DROP COLUMN {quoted_col};")
             conn.commit()
-            return True, f"表结构成功调整：{action_type} {col_name}"
+            return True, f"表结构成功调整：{action} {col_name}"
     except Exception as exc:
         return False, f"修改表结构失败: {exc}"
 
 
 def api_rename_table_field(user: dict | None, table_name: str, old_name: str, new_name: str) -> tuple[bool, str]:
-    """重命名表字段。
+    """重命名表字段（内置列同样允许改名——内置列只是"初始化一次"的种子）。
 
     权限：field:write —— 仅 financial_role / admin（业务层校验）。
     DDL 执行层：用 get_admin_connection()（ALTER TABLE 需表属主权限）。
-    ⚠️ 注意：重命名会影响写入该列的代码（如 api_save_contract_from_ai 里
-    写死的列名），建议只对用户扩展的自定义字段重命名；内置字段
-    （合同编号/甲方/合同金额等）如需改名，必须同步修改入库 SQL。
+    列目录化后的语义（v2）：
+      · 系统列（id/创建时间）禁止改名；系统列之外的任何列（含合同编号/甲方等
+        内置列）均可改名；
+      · 物理列改名后，同步 UPDATE column_catalog 的 col_name（按逻辑键匹配），
+        唯一键/状态/历史等语义标志随逻辑键保留，不会因改名丢失；
+      · 目录行缺失时（理论不出现，因读取前已对账）只告警不阻断。
+    ⚠️ 已知局限（文档化）：本阶段台账写入/AI 提示词等代码仍按旧版写死的
+    中文列名运行——若改名的列被这些代码引用，相关功能会报错/跳过；
+    全部列读写改为"目录驱动"是下一阶段（不影响本阶段字段调整能力的落地）。
     返回：(是否成功, 提示信息)。
     """
     ok, msg = require_permission(user, FIELD_WRITE_PERMISSION)
@@ -440,13 +882,89 @@ def api_rename_table_field(user: dict | None, table_name: str, old_name: str, ne
     if old_name == new_name:
         return False, "新旧字段名相同，无需修改！"
 
+    # 语义保护：系统列不可改名（目录读取失败时用系统列名字兜底）
+    meta = _catalog_by_col(table_name).get(old_name) or {}
+    if bool(meta.get("is_system_col")) or old_name in _SYSTEM_COLUMN_FALLBACK:
+        return False, f"「{old_name}」是系统列（id/创建时间），不可改名！"
+    # 新名字不得与现有物理列重复
+    try:
+        if new_name in _physical_column_names(table_name):
+            return False, f"栏目「{new_name}」已存在，无法改名为重名！"
+    except Exception:
+        pass  # 读取物理列失败时交给数据库层报错
+
     try:
         with get_admin_connection() as conn, conn.cursor() as cur:
             cur.execute(f'ALTER TABLE {table_name} RENAME COLUMN "{old_name}" TO "{new_name}";')
+            # 同步目录：按逻辑键匹配（col_name 是展示层，改名不改变语义）
+            cur.execute(
+                "UPDATE column_catalog SET col_name = %s "
+                "WHERE table_name = %s AND col_name = %s",
+                (new_name, table_name, old_name),
+            )
+            if cur.rowcount == 0:
+                print(f"⚠️ [column_catalog] 重命名 {old_name} 时目录未匹配到行（跳过目录同步）")
             conn.commit()
             return True, f"字段重命名成功：{old_name} -> {new_name}"
     except Exception as exc:
         return False, f"重命名字段失败: {exc}"
+
+
+def api_set_key_column(user: dict | None, table_name: str, col_name: str) -> tuple[bool, str]:
+    """把指定列设为当前唯一键列（唯一键移交）。
+
+    场景：删除内置唯一键列（合同编号）前必须先调用本函数，把"覆盖/去重依据"
+    移交到另一列；移交后该列被标记 is_key_col，原键列取消标志（可再删除）。
+
+    权限：field:write —— 仅 financial_role / admin。
+    实现（管理员连接，顺序执行，任一失败即中止并给出原因）：
+      1. ALTER COLUMN SET NOT NULL       —— 唯一键列不允许空值；
+      2. CREATE UNIQUE INDEX（按列名哈希命名，幂等）—— 列值必须唯一，
+         存在重复值时 PostgreSQL 抛错，此处转成友好提示；
+      3. UPDATE column_catalog 移交 is_key_col 标志（同表内互斥）。
+    返回：(是否成功, 提示信息)。
+    """
+    ok, msg = require_permission(user, FIELD_WRITE_PERMISSION)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    if not re.match(r"^[\w\u4e00-\u9fa5]+$", col_name):
+        return False, "字段名只能包含中英文、数字和下划线！"
+
+    meta = _catalog_by_col(table_name).get(col_name)
+    if not meta:
+        return False, f"栏目「{col_name}」不存在或列目录未就绪，无法设为唯一键！"
+    if meta.get("is_system_col") or col_name in _SYSTEM_COLUMN_FALLBACK:
+        return False, f"「{col_name}」是系统列，不可设为唯一键！"
+    if meta.get("is_key_col"):
+        return False, f"「{col_name}」已是当前唯一键列，无需重复设置！"
+
+    # 唯一索引名按列名哈希生成（跨进程稳定，避免同名索引指向旧列导致无法重建）
+    index_name = f"uq_{table_name}_{hashlib.sha1(col_name.encode('utf-8')).hexdigest()[:8]}"
+    try:
+        with get_admin_connection() as conn, conn.cursor() as cur:
+            cur.execute(f'ALTER TABLE {table_name} ALTER COLUMN "{col_name}" SET NOT NULL;')
+            cur.execute(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {table_name} ("{col_name}");'
+            )
+            # 移交标志：同表内 is_key_col 互斥（旧键列自动取消）
+            cur.execute(
+                "UPDATE column_catalog SET is_key_col = (col_name = %s) "
+                "WHERE table_name = %s",
+                (col_name, table_name),
+            )
+            conn.commit()
+            return True, f"已把「{col_name}」设为唯一键列（原唯一键列已取消该标志）"
+    except Exception as exc:
+        err_text = str(exc)
+        hint = ""
+        if "null value" in err_text or "contains null" in err_text:
+            hint = "（该列存在空值，请先补全/清空空行）"
+        elif "duplicate key" in err_text or "Duplicate" in err_text:
+            hint = "（该列存在重复值，请先清理重复后再试）"
+        return False, f"设为唯一键失败: {exc}{hint}"
 
 
 def api_ai_analyze_user_habits() -> dict:

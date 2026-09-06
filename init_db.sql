@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS sys_users (
     email VARCHAR(100) UNIQUE NOT NULL,
     phone VARCHAR(20) UNIQUE NOT NULL,
     role_type VARCHAR(20) DEFAULT 'finance_staff',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    last_login_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -214,3 +216,17 @@ ON CONFLICT DO NOTHING;
 -- 11. 收尾再补授一次权限（覆盖上面新建的向量表/索引）
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO finance_app_role;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO finance_app_role;
+
+-- 12. 最高管理员（admin）单例约束：任何时刻至多一个 role_type='admin'
+--     首个注册用户自动成为 admin（register_user 先查后插，本索引兜底并发竞态：
+--     两人同时通过"无 admin"检查时，唯一索引只放行一个，失败者降级为普通角色）；
+--     转让最高管理员时在同一事务内 旧主降级 -> 新主提升，本索引保证全程唯一。
+--     注意：部分唯一索引的键必须是"所有 admin 行取值相同的列"——即谓词列
+--     role_type 本身（不能用 user_id，主键天然唯一，永远不冲突）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sys_users_single_admin
+    ON sys_users (role_type) WHERE role_type = 'admin';
+
+-- 13. sys_users 扩展：账号停用标记 + 最近登录时间（老库幂等补齐；新库见上方建表语句）
+--     is_active=FALSE 的账号登录被拒（authenticate_user 校验），用于"注销账户/停用"。
+ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE sys_users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
