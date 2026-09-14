@@ -1,0 +1,6 @@
+# 行尾策略：不能依赖每个人的 core.autocrlf（各机器设置不同），这里兜底。
+#
+# *.bat 必须是 CRLF：cmd 解析 `if not exist ... (` 这类块、以及 `pause` 对行尾敏感，
+# LF 行尾的 .bat 在部分系统上会解析错甚至卡在 pause（2026-09-15 实测踩过）。
+*.bat text eol=crlf
+*.ps1 text eol=crlf

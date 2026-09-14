@@ -1,12 +1,12 @@
 -- 1. 创建角色（若已存在则忽略）
 -- ⚠️ 口令**不写在文件里**（本文件入库）：下面 `pw` 的初值是字典里的"口令占位符"
 --    （形如 __APP + DB_PASS__ 的那个 token，见 .env.example 同名说明），由
---    database_serv__infra.render_init_sql() 在执行前用 .env 的 APP_DB_PASS 替换。
+--    infra/database_serv__infra.py 的 render_init_sql() 在执行前用 .env 的 APP_DB_PASS 替换。
 --    注：注释里**故意不写完整的 token 字面量**——替换是全文替换，写在注释里等于
 --    把真口令又抄进内存中的脚本一份。
 --    正常入口（会自动注入，推荐）：
---        python workspace__infra.py init-db --all
---        python -c "from database_serv__infra import init_db; print(init_db())"
+--        python -m infra.workspace__infra init-db --all
+--        python -c "from infra.database_serv__infra import init_db; print(init_db())"
 --    手工 psql 直接跑本文件不会被替换 → 脚本会**直接报错**，而不是建出一个
 --    "口令恰好等于占位符"的角色（那种静默错误比报错难查得多）。
 DO $$
@@ -14,12 +14,16 @@ DECLARE
     pw text := '__APP_DB_PASS__';
 BEGIN
     IF pw = '__APP' || '_DB_PASS__' THEN
-        RAISE EXCEPTION '口令占位符未被替换：请用 `python workspace__infra.py init-db --all` 执行本脚本';
+        RAISE EXCEPTION '口令占位符未被替换：请用 `python -m infra.workspace__infra init-db --all` 执行本脚本';
     END IF;
     BEGIN
         EXECUTE format('CREATE ROLE finance_app_role WITH LOGIN PASSWORD %L', pw);
     EXCEPTION WHEN duplicate_object THEN
-        RAISE NOTICE '角色已存在，跳过创建';
+        -- 角色已存在：把口令**同步**成 .env 的值（.env 是唯一真相源）。
+        -- 于是"改了 .env 的 APP_DB_PASS → 跑 init-db --all"即可生效，
+        -- 不必再手工 ALTER ROLE；也避免出现"改了 .env 却和库里不一致"。
+        EXECUTE format('ALTER ROLE finance_app_role WITH LOGIN PASSWORD %L', pw);
+        RAISE NOTICE '角色已存在，已按 .env 同步口令';
     END;
 END $$;
 

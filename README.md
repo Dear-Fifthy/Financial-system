@@ -86,15 +86,20 @@
 
 ### 9. 诊断与自检（命令行工具）
 
+模块按层归入子目录，命令统一用 `python -m <层>.<模块>`（在仓库根执行）：
+
 | 命令 | 作用 |
 |---|---|
-| `python workspace__infra.py list / info / self-test` | 仓库列表/体检、隔离自检（文档互斥、编号独立、密钥互不可解、权限全覆盖） |
-| `python sample_corpus__infra.py --list / --verify / --smoke` | 合成样例语料的装载、真值自检、两条召回腿对比（不需要 OCR/AI） |
-| `python project_audit__infra.py` | 项目体检：临时文件、空文件、孤儿模块、漏进版本库的敏感文件 |
-| `python query_planner__ai.py --rules / --overview / --plan "问题"` | 需求判断：规则路由 / 当前仓库统计 / 完整规划 |
-| `python doc_index__graph.py` | 生成"文档索引卡"（特征明文 + 概括 + 关键事实） |
-| `python scanner_entrance__scan.py` | 无界面批量扫描 `input/` |
-| `python benchmark_ocr__scan.py`、`python monitor__infra.py` | OCR 压测、性能采样 |
+| `python -m infra.workspace__infra list / info / self-test` | 仓库列表/体检、隔离自检（文档互斥、编号独立、密钥互不可解、权限全覆盖） |
+| `python -m infra.sample_corpus__infra --workspace sample --verify` | 合成样例语料的装载、真值自检、两条召回腿对比（不需要 OCR/AI） |
+| `python -m infra.project_audit__infra` | 项目体检：临时文件、空文件、孤儿模块、目录结构、漏进版本库的敏感文件/凭据 |
+| `python -m ai.query_planner__ai --rules / --overview / --plan "问题"` | 需求判断：规则路由 / 当前仓库统计 / 完整规划 |
+| `python -m graph.doc_index__graph` | 生成"文档索引卡"（特征明文 + 概括 + 关键事实） |
+| `python -m scan.scanner_entrance__scan` | 无界面批量扫描 `input/` |
+| `python -m scan.benchmark_ocr__scan`、`python -m infra.monitor__infra` | OCR 压测、性能采样 |
+
+> 也可以直接按文件路径跑（每个可独立运行的入口都带 bootstrap 头，会把仓库根放回 `sys.path`）：
+> `.\.venv\Scripts\python.exe scan\scanner_entrance__scan.py`。
 
 ---
 
@@ -163,17 +168,21 @@ Copy-Item .env.example .env
 # 3) 准备数据库（会自动建库、建表、建角色、灌权限目录）
 #    口令从 .env 注入，绝不写进 init_db.sql（入库文件）；
 #    手工 `psql -f init_db.sql` 不会被注入，脚本会直接报错提醒。
-.\.venv\Scripts\python.exe -c "from database_serv__infra import init_db; print(init_db())"
+.\.venv\Scripts\python.exe -c "from infra.database_serv__infra import init_db; print(init_db())"
 
 # 4) 把当前环境登记为第一个"仓库"（沿用现有库与目录，零迁移）
-.\.venv\Scripts\python.exe workspace__infra.py register-legacy --name 我的账套
+.\.venv\Scripts\python.exe -m infra.workspace__infra register-legacy --name 我的账套
 
 # 5) 启动界面（或直接双击 launch_table.bat）
-.\.venv\Scripts\python.exe table__ui.py
+.\.venv\Scripts\python.exe ui\table__ui.py
 ```
 
 首次登录：**第一个注册的账号自动成为最高管理员**（之后注册的都是财务专员，
 可在「设置 → 用户管理」里调整）。
+
+> **改口令**：只改 `.env` 的 `APP_DB_PASS`，再跑 `python -m infra.workspace__infra init-db --all`
+> 即同步到数据库角色（`init_db.sql` 在角色已存在时会执行 `ALTER ROLE … PASSWORD`）。
+> 改完请重启程序——口令是在导入期读进内存的。
 
 ## 四、配置项（`.env`，共约 60 项，按用途分组）
 
@@ -194,33 +203,57 @@ Copy-Item .env.example .env
 ## 五、目录结构
 
 ```
-├─ table__ui.py / *_ui.py          界面（主窗 + 各管理对话框）
-├─ hub_pipeline__desens.py         扫描→脱敏→落盘流水线
-├─ table_desens__desens.py         表格布局判定与脱敏
-├─ office_reader__desens.py        docx/xlsx 直读
-├─ ocr_tables__desens.py           OCR 表格解析
-├─ scanner_core__scan.py           扫描核心（OCR/超时/熔断）
-├─ l1_extract__summary_hash.py     概括 + 哈希投影
-├─ l1_facts__fact_list.py          事实清单（取数层）
-├─ edge_build__graph_edges.py      关系边构建
-├─ graph_query__graph_walk.py      图遍历查询
-├─ query_planner__ai.py            需求判断（规则 + AI 规划）
-├─ chat_engine__ai.py / chat_*.py  对话链路
-├─ database_serv__infra.py         数据库与权限 API
-├─ workspace__infra.py             仓库（工作区）管理
-├─ ui_kit__ui.py / *_admin__ui.py  界面适配与管理窗口
-├─ init_db.sql                     建库/建表/权限种子（口令只留 __APP_DB_PASS__ 占位符）
-├─ .env.example                    配置模板（口令一律 your_*_here 占位符）
-├─ project_audit__infra.py         项目体检（临时文件/空文件/gitignore/凭据泄露）
-├─ docs/                           设计说明书
-├─ sample_docs/                    合成样例语料（本地测试用，默认不入库）
-├─ hub/                            脱敏产物（AI 唯一可读根）
-├─ input/ output/ logs/            源文件投放 / 逐页缓存 / 日志（均不入库）
-└─ workspaces/                     各仓库独立目录（含各自密钥，绝不入库）
+├─ ui/           界面层（15 个）
+│   ├─ table__ui.py                     主窗口（入口）
+│   ├─ ui_kit__ui.py                    自适应布局/字号/分栏工具
+│   └─ chat_panel__ui.py、*_admin__ui.py 对话面板与各管理窗口
+├─ scan/         扫描层（9 个）
+│   ├─ scanner_core__scan.py            扫描核心（OCR/超时/熔断）
+│   ├─ scanner_entrance__scan.py        无界面批量入口
+│   └─ table_split__scan.py、ocr_priority__scan.py … 版面切分/优先级/资源闸门
+├─ desens/       脱敏层（16 个，最大的一层）
+│   ├─ hub_pipeline__desens.py          扫描→脱敏→落盘流水线
+│   ├─ table_desens__desens.py          表格布局判定与脱敏
+│   ├─ office_reader__desens.py         docx/xlsx 直读
+│   └─ ocr_tables__desens.py、offset_map__desens.py … 表格解析/坐标偏移
+├─ l1/           L1 层（2 个）
+│   ├─ l1_extract__summary_hash.py      概括 + 特征哈希
+│   └─ l1_facts__fact_list.py           事实清单（取数层）
+├─ graph/        图层（3 个）
+│   ├─ doc_index__graph.py              文档索引卡
+│   ├─ edge_build__graph_edges.py       关系边构建
+│   └─ graph_query__graph_walk.py       图遍历查询
+├─ rag/          RAG 层（2 个）
+│   ├─ rag_store__rag.py                分块/存储/召回
+│   └─ embed_worker__rag.py             embedding 子进程
+├─ ai/           AI 层（5 个）
+│   ├─ ai_client__ai.py                 四条隔离链路的客户端
+│   ├─ ai_parser__ai.py                 字段解析/填表
+│   ├─ chat_engine__ai.py               对话链路
+│   └─ query_planner__ai.py             需求判断（规则 + AI 规划）
+├─ infra/        基础设施层（5 个）
+│   ├─ database_serv__infra.py          数据库与权限 API
+│   ├─ workspace__infra.py              仓库（工作区）隔离
+│   ├─ project_audit__infra.py          项目体检
+│   └─ sample_corpus__infra.py、monitor__infra.py
+├─ init_db.sql                         建库/建表/权限种子（口令只留 __APP_DB_PASS__ 占位符）
+├─ .env.example                        配置模板（口令一律 your_*_here 占位符）
+├─ launch_table.bat                    双击启动（调 ui\table__ui.py）
+├─ docs/                               设计说明书
+├─ sample_docs/                        合成样例语料（本地测试用，默认不入库）
+├─ hub/                                脱敏产物（AI 唯一可读根）
+├─ input/ output/ logs/                源文件投放 / 逐页缓存 / 日志（均不入库）
+└─ workspaces/                         各仓库独立目录（含各自密钥，绝不入库）
 ```
 
-> 模块命名约定：`<名字>__<层次>.py`，层次取值 `desens`（脱敏）/ `scan`（扫描）/
-> `ai`（AI 链路）/ `graph`（图）/ `rag`（向量）/ `ui`（界面）/ `infra`（基础设施）。
+> 模块命名约定：`<名字>__<层次>.py`（**文件名不改**），并按层次放进同名子目录；
+> 层次取值 `desens`（脱敏）/ `scan`（扫描）/ `l1`（概括与事实）/ `graph`（图）/
+> `rag`（向量）/ `ai`（AI 链路）/ `ui`（界面）/ `infra`（基础设施）。
+> 少数历史命名（`doc_index__graph`、`edge_build__graph_edges`、`graph_query__graph_walk`、
+> `l1_extract__summary_hash`、`l1_facts__fact_list`）后缀与所在层不同，是有意保留的，
+> 体检里的"结构检查"为它们开了白名单。
+> 导入统一写 `from <层>.<模块> import …`；仓库根一律用 `Path(__file__).resolve().parents[1]`
+> （不要再写 `Path(__file__).parent`——那会指到层目录去）。
 
 ## 六、已知限制
 
