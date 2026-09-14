@@ -23,11 +23,26 @@ import paddle  # 显式引入 paddle 库
 from paddleocr import PaddleOCRVL
 from dotenv import load_dotenv
 
+# 停止扫描（协作式取消）检查点：本模块在**逐页循环**里调 check()。
+# 注意：paddle/torch 很重，scan_control 只依赖标准库，放在这里不会引入额外开销。
+import scan_control__scan as scan_ctl
+
 BASE_DIR = Path(__file__).resolve().parent
-INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output"
+# input / output 随工作区（界面叫「仓库」）切换：见 workspace__infra。
+# output 里是**逐页原文级缓存**，属于业务材料，所以必须按仓库隔离，不能跨仓库复用。
+from workspace__infra import input_root as _input_root
+from workspace__infra import output_root as _output_root
+
+INPUT_DIR = _input_root()
+OUTPUT_DIR = _output_root()
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-SUPPORTED_INPUT_EXTENSIONS = {".pdf", *SUPPORTED_IMAGE_EXTENSIONS}
+# Office 文件：**能直接提取文字就绝不进 OCR**（xlsx=openpyxl 直读；docx=stdlib 直读）
+SUPPORTED_OFFICE_EXTENSIONS = {".xlsx", ".docx"}
+# 旧版 Office：需先转换（LibreOffice 或 Office COM），失败则提示另存为；源文件不动
+LEGACY_OFFICE_EXTENSIONS = {".doc", ".xls"}
+SUPPORTED_INPUT_EXTENSIONS = {
+    ".pdf", *SUPPORTED_IMAGE_EXTENSIONS, *SUPPORTED_OFFICE_EXTENSIONS, *LEGACY_OFFICE_EXTENSIONS
+}
 
 # =========================================================
 # OCR 运行环境配置（全部可通过项目根目录 .env 覆盖）
@@ -62,7 +77,10 @@ OCR_FAIL_THRESHOLD = _env_int("OCR_FAIL_THRESHOLD", 3)
 # 单次 predict（一页）耗时超过 OCR_PAGE_TIMEOUT_S 记为"慢页"；连续
 # OCR_SLOW_REBUILD_LIMIT 个慢页后重建模型实例一次（排除实例状态被拖慢）。
 # 注意：进程内无法强杀卡死的 C++ 调用，硬超时终止需要进程级隔离（后续方案）。
-OCR_PAGE_TIMEOUT_S = _env_int("OCR_PAGE_TIMEOUT_S", 180)
+# 单页 OCR **硬上限**（用户约定：单页最长 120s，超时直接放弃这份扫描，不傻等）
+OCR_PAGE_TIMEOUT_S = _env_int("OCR_PAGE_TIMEOUT_S", 120)
+# 放弃后进入冷却：被放弃的推理线程是 daemon、进程内杀不掉，冷却期内不再发起新 OCR
+OCR_ABANDON_COOLDOWN_S = _env_int("OCR_ABANDON_COOLDOWN_S", 300)
 OCR_SLOW_REBUILD_LIMIT = _env_int("OCR_SLOW_REBUILD_LIMIT", 2)
 # ---- 模型重建守卫（防"重复初始化"刷屏/无限循环）----
 # 失败重试与慢页重建共用一个重建入口（_rebuild_ocr）：
@@ -252,6 +270,13 @@ _OCR_BREAKER = OcrCircuitBreaker(OCR_FAIL_THRESHOLD)
 _OCR_MONITOR_STATE = {"running": False, "started_at": 0.0, "hung_logged": False}
 _OCR_MONITOR_STARTED = {"flag": False}
 _OCR_SLOW_PAGES = {"count": 0}
+# 单页超时放弃后的冷却截止时间（monotonic）
+_OCR_ABANDON_STATE = {"until": 0.0}
+
+
+class OcrAbandoned(RuntimeError):
+    """单页 OCR 超过 OCR_PAGE_TIMEOUT_S → 按约定**放弃本次扫描**（不是模型故障）。"""
+
 # 重建守卫状态：冷却时间戳 + 进程内累计重建次数（防"重复初始化"）
 _REBUILD_STATE = {"last_time": 0.0, "count": 0, "lock": threading.Lock()}
 
@@ -365,25 +390,31 @@ def predict_safely(image_path, *, _retried: bool = False) -> list:
             f"OCR 已熔断（连续失败 {_OCR_BREAKER.fail_threshold} 次）。"
             "请检查 GPU 显存/驱动后重启程序，或在 .env 中设置 OCR_DEVICE=gpu 并关闭其它占用显存的程序。"
         )
+    if time.monotonic() < _OCR_ABANDON_STATE["until"]:
+        left = _OCR_ABANDON_STATE["until"] - time.monotonic()
+        raise OcrAbandoned(
+            f"上一次单页 OCR 超时被放弃，仍在冷却中（剩余 {left:.0f}s）："
+            "被放弃的推理线程还没归还 GPU，先不要继续扫描。"
+        )
 
     _start_page_monitor()
     _OCR_MONITOR_STATE["running"] = True
     _OCR_MONITOR_STATE["started_at"] = time.monotonic()
     _OCR_MONITOR_STATE["hung_logged"] = False
     t0 = time.monotonic()
-    # 每页 GPU 打点：开始/结束快照 + 耗时，写入 perf_monitor 日志（monitor.py）
+    # 每页 GPU 打点：开始/结束快照 + 耗时，写入 perf_monitor 日志（monitor__infra.py）
     # 目的：一眼看出"这一页是 GPU 在算还是 CPU 在算、显存变化多少"。
     try:
-        from monitor import log_snapshot_now
+        from monitor__infra import log_snapshot_now
 
         gpu_before = log_snapshot_now(f"predict 开始 {Path(image_path).name}")
     except Exception:
         gpu_before = {}
     try:
-        results = get_ocr().predict(str(image_path))
+        results = _predict_with_deadline(image_path, t0)
         _OCR_BREAKER.record_success()
         try:
-            from monitor import log_snapshot_now
+            from monitor__infra import log_snapshot_now
 
             gpu_after = log_snapshot_now(f"predict 结束 {Path(image_path).name}")
         except Exception:
@@ -396,21 +427,72 @@ def predict_safely(image_path, *, _retried: bool = False) -> list:
             flush=True,
         )
         return results
+    except OcrAbandoned:
+        _watch_slow_page(t0, "超时放弃")
+        raise
     except Exception as exc:
         _watch_slow_page(t0, "失败")
         if not _retried:
             # 统一走 _rebuild_ocr（带冷却+上限）丢弃被污染实例后再重试一次
             _rebuild_ocr(f"预测失败（{type(exc).__name__}）")
             try:
-                results = get_ocr().predict(str(image_path))
+                results = _predict_with_deadline(image_path, time.monotonic())
                 _OCR_BREAKER.record_success()
                 print("[OCR] 重建后重试成功。", flush=True)
                 return results
+            except OcrAbandoned:
+                raise
             except Exception as exc2:
                 _raise_ocr_failure(exc2)
         _raise_ocr_failure(exc)
     finally:
         _OCR_MONITOR_STATE["running"] = False
+
+
+def _predict_with_deadline(image_path, t0: float) -> list:
+    """在子线程里跑 predict，最多等 OCR_PAGE_TIMEOUT_S；超时抛 `OcrAbandoned`。
+
+    为什么用线程：Paddle 推理是 C++ 调用、Python 层没有可中断点，进程内杀不掉；
+    线程至少让**主流程**按约定在 120s 内退出（不再阻塞扫描）。
+    超时后写一条 `logs/perf/ocr_abandon_<date>.jsonl`，便于事后定位是哪一页。
+    """
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["res"] = get_ocr().predict(str(image_path))
+        except BaseException as exc:          # 线程内异常带回主线程再抛
+            box["exc"] = exc
+
+    th = threading.Thread(target=_run, daemon=True, name="ocr-predict")
+    th.start()
+    th.join(OCR_PAGE_TIMEOUT_S)
+    if th.is_alive():
+        _OCR_ABANDON_STATE["until"] = time.monotonic() + OCR_ABANDON_COOLDOWN_S
+        elapsed = time.monotonic() - t0
+        msg = (
+            f"单页 OCR 已运行 {elapsed:.0f}s 仍未返回（上限 {OCR_PAGE_TIMEOUT_S}s，"
+            f"文件 {Path(image_path).name}）→ 按约定**放弃本次扫描**。"
+            f"该页推理线程无法在进程内强杀，已进入 {OCR_ABANDON_COOLDOWN_S}s 冷却；"
+            "建议检查 GPU/驱动，或把该页单独拆出来再试。"
+        )
+        print(f"[OCR] ⛔ {msg}", flush=True)
+        try:
+            d = Path("logs/perf")
+            d.mkdir(parents=True, exist_ok=True)
+            with (d / f"ocr_abandon_{time.strftime('%Y%m%d')}.jsonl").open(
+                    "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "file": Path(image_path).name,
+                                    "elapsed_s": round(elapsed, 1),
+                                    "limit_s": OCR_PAGE_TIMEOUT_S},
+                                   ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        raise OcrAbandoned(msg)
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("res") or []
 
 
 def warmup_ocr() -> dict:
@@ -454,6 +536,10 @@ def _write_result_json_dict(result_json: dict, out_json: Path) -> None:
 
 
 def is_supported_input(file_path: Path) -> bool:
+    name = file_path.name
+    # 跳过 Office 打开文件时生成的临时/锁文件（~$xxx.xlsx），它们是垃圾内容
+    if name.startswith("~$") or name.startswith(".~"):
+        return False
     return file_path.is_file() and file_path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
 
 
@@ -475,25 +561,160 @@ def expand_paths(paths: Iterable[Path]) -> list[Path]:
     return collected
 
 
+def expand_inputs(paths: Iterable[Path]) -> list[tuple[Path | None, Path]]:
+    """展开输入 → [(源文件夹根, 文件路径), …]（**保留文件夹归属**）。
+
+    与 expand_paths 的区别：文件夹输入时记下"根目录"，让 hub 能按源文件夹
+    结构落盘（hub/<源文件夹子树>/<文件名>.json），不再把一个文件夹里的文件
+    在 hub 根目录里拆成一堆散文件；直接拖入的单个文件根为 None（仍落 hub 根）。
+    """
+    out: list[tuple[Path | None, Path]] = []
+    for path in paths:
+        if path.is_dir():
+            root = path.resolve()
+            for child in sorted(path.rglob("*")):
+                if is_supported_input(child):
+                    out.append((root, child))
+        elif is_supported_input(path):
+            out.append((None, path))
+    return out
+
+
+def _cached_pages(file_path: Path, file_output_dir: Path) -> list[Path] | None:
+    """页缓存可复用时返回按页序排列的 page_XXX.json 路径，否则 None。
+
+    安全性依据：缓存目录名含**源文件内容指纹**（`<stem>__<hash10>`），同目录 ⇒ 同内容
+    ⇒ 上次的 OCR/文字提取结果依然成立。这里再做一层完整性校验：页数对得上、每页
+    JSON 都能解析且 `res` 非空；任何一项不满足就退回真实扫描（不猜、不半用）。
+    """
+    import json
+
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        try:
+            from pdf_native_extractor__scan import split_pdf_pages
+
+            page_count = len(split_pdf_pages(file_path))
+        except Exception:
+            return None
+    else:
+        page_count = 1
+    if page_count <= 0:
+        return None
+    paths: list[Path] = []
+    for i in range(1, page_count + 1):
+        p = file_output_dir / f"page_{i:03d}.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not (data.get("res") or {}):
+            return None
+        paths.append(p)
+    return paths
+
+
 def process_file(
     file_path: Path,
     output_root: Path = OUTPUT_DIR,
     on_page_json=None,
+    content_hash: str | None = None,
 ) -> list[Path]:
     """处理单个文件，产出逐页 json 缓存。
 
     on_page_json：可选回调（接收 Path），在**每一页 json 落盘后立即调用**
     （下一页开始 OCR 之前）。配合流水线重叠：调用方可以在扫描的同时
     立刻处理本页结果，不必等整份文件扫完。
+
+    content_hash：源文件内容指纹（调用方通常已经算过，避免重复哈希）。缓存目录名带上
+    指纹（`<stem>__<指纹前10位>`），防止**不同文件夹里的同名文件**共用同一缓存目录、
+    互相覆盖 `page_*.json`；同内容 → 同目录，缓存天然可复用。
     """
     ensure_workspace_dirs()
 
-    file_output_dir = output_root / file_path.stem
+    import dedup__desens
+
+    tag = content_hash or dedup__desens.content_key(file_path)
+    file_output_dir = output_root / dedup__desens.cache_dir_name(file_path, tag)
     file_output_dir.mkdir(parents=True, exist_ok=True)
 
-    if file_path.suffix.lower() == ".pdf":
-        return _process_pdf(file_path, file_output_dir, on_page_json)
+    # OCR 前释放内存/显存（需求）：真要进 OCR 分支时兜底调用一次
+    # （UI 侧在"开始 OCR 组"时会先主动调一次 force=True；这里保证 CLI/批处理也有）。
+    suffix = file_path.suffix.lower()
+    is_ocr_source = (suffix == ".pdf"
+                     or suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"})
+    if is_ocr_source:
+        # **页缓存复用**：缓存目录名里已经带了**源文件内容指纹**（同内容→同目录），
+        # 因此目录里页齐且都能解析时，可直接复用上次的 OCR/文字提取结果，
+        # 不必再跑一遍 GPU（重扫 7 份文档里那 1 份 PDF 实测单页 OCR >3 分钟）。
+        # 只对 PDF/图片生效：Office 直读产物是**已脱敏**的页 JSON，复用会把旧脱敏结果带回来。
+        cached = _cached_pages(file_path, file_output_dir)
+        if cached:
+            print(f"[OCR] 复用已有页缓存（{len(cached)} 页，源文件内容未变）", flush=True)
+            for p in cached:
+                if on_page_json is not None:
+                    on_page_json(p)
+            return cached
+        try:
+            import resource_release__scan as resource_release
+
+            # 注意用**别名**调用：写成 `resource_release__scan.release_before_ocr(...)`
+            # 会 NameError（模块名不绑定到局部作用域）→ 释放被静默跳过（实测）。
+            resource_release.release_before_ocr(reason=f"扫描 {file_path.name} 前释放资源")
+        except Exception as exc:
+            print(f"[资源释放] 跳过（{type(exc).__name__}: {exc}）", flush=True)
+
+    # 重活闸门：OCR/直读是整条链路里最吃 GPU/CPU 的一步，与后台 embedding 共用一把锁，
+    # 保证"同一时刻只有一个重活"（串行排队，而不是抢资源）。
+    # 传 cancel_check：在**排队等锁**时也能响应"停止扫描"（否则要等前一个重活跑完）。
+    from runtime_lane__scan import heavy_lane
+
+    scan_ctl.check("扫描前")
+    with heavy_lane("ocr_scan", cancel_check=lambda: scan_ctl.check("等待重活闸门")):
+        if file_path.suffix.lower() == ".pdf":
+            return _process_pdf(file_path, file_output_dir, on_page_json)
+        if file_path.suffix.lower() in SUPPORTED_OFFICE_EXTENSIONS:
+            # Office：直接提取文字/表格（xlsx、docx），**不经过 OCR**
+            return _process_office(file_path, file_output_dir, on_page_json)
+        if file_path.suffix.lower() in LEGACY_OFFICE_EXTENSIONS:
+            # 旧版 Office（.doc/.xls）：先转换（只读源文件）→ 再直读；失败给出提示
+            from legacy_convert__desens import convert_legacy
+
+            converted, message = convert_legacy(file_path)
+            if converted is None:
+                raise RuntimeError(message)
+            print(f"[Office] {message}", flush=True)
+            return _process_office(converted, file_output_dir, on_page_json,
+                                   origin=file_path)
+        return _process_image(file_path, file_output_dir, on_page_json)
     return _process_image(file_path, file_output_dir, on_page_json)
+
+
+def _process_office(file_path: Path, file_output_dir: Path, on_page_json=None,
+                    origin: Path | None = None) -> list[Path]:
+    """Office 直读分支（xlsx/docx）：完全不加载 OCR 模型。
+
+    产出与原生文本页同构的页 JSON（含 `desensitized: true` 与 tables），
+    hub 流水线据此跳过二次脱敏。origin 非空时表示来自 .doc/.xls 转换，
+    会在页 JSON 里记录来源（可追溯，且源文件始终未改动）。
+    """
+    from office_reader__desens import read_office
+
+    written_paths: list[Path] = []
+    for index, page_json in enumerate(read_office(file_path), start=1):
+        scan_ctl.check(f"Office 直读第 {index} 页前")     # 停止扫描检查点
+        if origin is not None:
+            res = page_json.setdefault("res", {})
+            res["converted_from"] = origin.suffix.lower()
+            res["source_file_original"] = origin.name
+        out_json = file_output_dir / f"page_{index:03d}.json"
+        _write_result_json_dict(page_json, out_json)
+        written_paths.append(out_json)
+        if on_page_json is not None:
+            on_page_json(out_json)
+    return written_paths
 
 
 def _process_image(file_path: Path, file_output_dir: Path, on_page_json=None) -> list[Path]:
@@ -502,6 +723,7 @@ def _process_image(file_path: Path, file_output_dir: Path, on_page_json=None) ->
     written_paths: list[Path] = []
 
     for index, result_entry in enumerate(result_list, start=1):
+        scan_ctl.check(f"图片 OCR 第 {index} 页前")       # 停止扫描检查点
         page_index = None
         result_json = getattr(result_entry, "json", None)
         if isinstance(result_json, dict):
@@ -525,7 +747,7 @@ def _process_pdf(pdf_path: Path, file_output_dir: Path, on_page_json=None) -> li
     """
     import fitz  # PyMuPDF
 
-    from pdf_native_extractor import (
+    from pdf_native_extractor__scan import (
         extract_native_page_json,
         render_page_to_image,
         split_pdf_pages,
@@ -539,6 +761,8 @@ def _process_pdf(pdf_path: Path, file_output_dir: Path, on_page_json=None) -> li
 
     try:
         for page_index, is_native in page_kinds:
+            # 停止扫描检查点：上一页已完整落盘，这里中断不产生半截产物
+            scan_ctl.check(f"PDF 第 {page_index + 1} 页前")
             page_number = page_index + 1
             page_name = f"page_{page_number:03d}"
             out_json = file_output_dir / f"{page_name}.json"

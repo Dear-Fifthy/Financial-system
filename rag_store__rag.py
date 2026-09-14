@@ -1,6 +1,6 @@
 """RAG 向量库模块：分块 + 向量化 + pgvector 存储。
 
-文件位置：项目根目录新增 rag_store.py。
+文件位置：项目根目录新增 rag_store__rag.py。
 职责：
   - chunk_document()      ：把文档文本切成检索块（标题感知 + 固定窗口兜底）
   - embed_texts()         ：向量化（可插拔：本地 bge / 外部 embedding API）
@@ -175,7 +175,7 @@ def chunk_document(
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """把文本列表向量化，返回 list[list[float]]。
 
-    local 后端：在**独立子进程**（embed_worker.py）里跑 sentence-transformers。
+    local 后端：在**独立子进程**（embed_worker__rag.py）里跑 sentence-transformers。
       ⚠️ 为什么用子进程：torch 与 paddlepaddle 同进程先后加载会触发 DLL 冲突
       （实测先 paddle 后 torch -> WinError 127），而主程序必然先加载 paddle，
       所以 embedding 必须隔离到子进程，主进程永不 import torch。
@@ -189,7 +189,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def _embed_via_subprocess(texts: list[str]) -> list[list[float]]:
-    """本地 embedding：委托 embed_worker.py 子进程执行（DLL 隔离）。
+    """本地 embedding：委托 embed_worker__rag.py 子进程执行（DLL 隔离）。
 
     子进程 stdin 传文本列表，stdout 收 JSON 向量；模型每次调用加载一次。
     超时：RAG_EMBED_TIMEOUT_S（默认 1800s）——首次运行需联网下载 bge 模型
@@ -198,7 +198,7 @@ def _embed_via_subprocess(texts: list[str]) -> list[list[float]]:
     import subprocess
     import sys
 
-    worker = Path(__file__).resolve().parent / "embed_worker.py"
+    worker = Path(__file__).resolve().parent / "embed_worker__rag.py"
     if not worker.exists():
         raise RuntimeError(f"找不到 embedding 工作器：{worker}")
     payload = json.dumps(texts, ensure_ascii=False).encode("utf-8")
@@ -247,7 +247,7 @@ def _embed_via_api(texts: list[str]) -> list[list[float]]:
 # =========================================================
 def _get_connection():
     """复用 database_serv 的应用连接配置（同一 app 角色）。"""
-    from database_serv import APP_DB_CONFIG
+    from database_serv__infra import APP_DB_CONFIG
 
     return psycopg2.connect(**APP_DB_CONFIG)
 
@@ -267,7 +267,7 @@ def ensure_table() -> None:
     "expected 1024 dimensions, not 512"），自动 删索引→改列类型→重建索引。
     建表/迁移后补授应用角色 DML 权限（表 + 自增序列）。
     """
-    from database_serv import APP_DB_CONFIG, get_admin_connection
+    from database_serv__infra import APP_DB_CONFIG, get_admin_connection
 
     app_user = APP_DB_CONFIG["user"]
     with get_admin_connection() as conn, conn.cursor() as cur:
@@ -383,6 +383,9 @@ def index_hub_json(hub_json_path: Path, meta: dict | None = None) -> tuple[int, 
 
     返回 (块数, 说明)。
     """
+    from ai_guard__desens import require_hub_file   # AI 输入守卫：embedding 也是 AI 链路，只允许 hub/
+
+    hub_json_path = require_hub_file(hub_json_path, purpose="RAG 索引（embedding）")
     doc = json.loads(hub_json_path.read_text(encoding="utf-8"))
     full_text = "\n".join(doc.get("pages", []))
     chunks = chunk_document(full_text)
@@ -391,19 +394,19 @@ def index_hub_json(hub_json_path: Path, meta: dict | None = None) -> tuple[int, 
     m = meta or {}
     m.setdefault("category", doc.get("category", ""))
     m.setdefault("source_file", doc.get("source_file", hub_json_path.name))
-    doc_key = m.get("doc_key") or hub_json_path.stem
+    doc_key = m.get("doc_key") or doc.get("doc_key") or hub_json_path.stem
     embeddings = embed_texts(chunks)  # 本地/API 按 RAG_EMBED_BACKEND
     n = upsert_chunks(doc_key, chunks, [m] * len(chunks), embeddings)
     return n, f"已索引 {n} 块（{doc_key}）"
 
 
 if __name__ == "__main__":
-    # 调试入口：python rag_store.py <hub json 路径>
+    # 调试入口：python rag_store__rag.py <hub json 路径>
     import sys
 
     p = sys.argv[1] if len(sys.argv) > 1 else ""
     if not p:
-        print("用法：python rag_store.py <hub/xxx.json>")
+        print("用法：python rag_store__rag.py <hub/xxx.json>")
         sys.exit(1)
     n, msg = index_hub_json(Path(p))
     print(msg)

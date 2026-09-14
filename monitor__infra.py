@@ -1,9 +1,9 @@
 """性能监控模块：实时观察【线程列表 / 进程 CPU / GPU 占用】。
 
-文件位置：项目根目录新增 monitor.py。
+文件位置：项目根目录新增 monitor__infra.py。
 用途：诊断"扫描慢到底是程序问题还是 PaddleOCR-VL 本身"——
   - 周期性采样（默认每 3s）写入 logs/perf_monitor.log（logs/ 目录自动创建）；
-  - table.py 启动时自动开启；benchmark_ocr.py 用它做基准判定。
+  - table__ui.py 启动时自动开启；benchmark_ocr__scan.py 用它做基准判定。
 
 判定口径（配合日志看）：
   - 页面处理期间 GPU 利用率持续高（>70%）→ 计算确在 GPU 上，慢是模型本身特性；
@@ -105,17 +105,45 @@ def _run() -> None:
             pass
 
 
+def prune_old_logs(max_age_hours: int = 24) -> list[str]:
+    """清理 logs/ 下超过 max_age_hours 的监控日志（默认 24 小时）。
+
+    范围限制：只处理 logs/ **直属** 的 *.log（perf_monitor.log 等监控输出），
+    不进入子目录——尤其不碰 logs/chat 下的会话数据（业务数据，非监控日志）。
+    做法：旧文件清空保留（避免句柄/权限问题导致删除失败）。
+    返回被清理的文件名列表；任何异常都不影响主流程。
+    """
+    cleared: list[str] = []
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        cutoff = time.time() - max_age_hours * 3600
+        for path in LOG_DIR.glob("*.log"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.write_text("", encoding="utf-8")
+                    cleared.append(path.name)
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return cleared
+
+
 def start_performance_monitor(interval: int = 3) -> Path:
     """启动性能监控（幂等：已启动则直接返回日志路径）。
 
-    返回日志文件路径。采样：线程列表 + 进程 CPU% + GPU 利用率/显存/功耗。
+    启动时先按 24 小时保留策略清理旧监控日志（见 prune_old_logs）。
+    采样：线程列表 + 进程 CPU% + GPU 利用率/显存/功耗。
     """
     if _state["running"]:
         return _state["path"]
     LOG_DIR.mkdir(exist_ok=True)
+    cleared = prune_old_logs(24)
     path = LOG_DIR / "perf_monitor.log"
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"\n===== 监控开始 {time.strftime('%Y-%m-%d %H:%M:%S')}（间隔 {interval}s）=====\n")
+        if cleared:
+            f.write(f"（已清理超过 24h 的旧监控日志：{', '.join(cleared)}）\n")
     _state.update({"running": True, "interval": interval, "path": path})
     _state["thread"] = threading.Thread(target=_run, daemon=True, name="perf-monitor")
     _state["thread"].start()

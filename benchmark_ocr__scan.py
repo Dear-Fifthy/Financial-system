@@ -1,8 +1,8 @@
 """OCR 基准测试：判定"扫描慢是程序问题还是 PaddleOCR-VL 本身"。
 
-文件位置：项目根目录新增 benchmark_ocr.py。
+文件位置：项目根目录新增 benchmark_ocr__scan.py。
 用法：
-    python benchmark_ocr.py [PDF路径] [页数]
+    python benchmark_ocr__scan.py [PDF路径] [页数]
 
 流程：
   1. 打印环境报告：设备决策 / paddle CUDA / GPU 显存 / CPU 核数 / 推理引擎；
@@ -33,9 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fitz  # noqa: E402
 
-from monitor import gpu_snapshot, start_performance_monitor, stop_performance_monitor  # noqa: E402
-from pdf_native_extractor import render_page_to_image  # noqa: E402
-from scanner_core import OCR_ENGINE, predict_safely, resolve_ocr_device  # noqa: E402
+from monitor__infra import gpu_snapshot, start_performance_monitor, stop_performance_monitor  # noqa: E402
+from pdf_native_extractor__scan import render_page_to_image  # noqa: E402
+from scanner_core__scan import OCR_ENGINE, predict_safely, resolve_ocr_device  # noqa: E402
 
 
 def _env_report() -> str:

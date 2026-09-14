@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from pathlib import Path
 import re
 import uuid
@@ -36,10 +37,34 @@ ADMIN_DB_CONFIG = {
 APP_DB_CONFIG = {
     "dbname": os.getenv("APP_DB_NAME", "fin_system_db"),
     "user": os.getenv("APP_DB_USER", "finance_app_role"),
-    "password": os.getenv("APP_DB_PASS", "finance_secret_123"),
+    # ⚠️ 不设"兜底口令"：口令只允许来自 .env（已被 .gitignore 挡住）。
+    #    以前这里写过 `os.getenv("APP_DB_PASS", "<某个明文口令>")`——那个明文
+    #    就是本机真口令，等于抄了一份进版本库（连注释里举例都会被抓，
+    #    见 project_audit__infra.secret_leaks：全文搜 .env 真值，命中即报）。
+    #    现在留空：没配就连不上并明确报错，不给"悄悄用了弱默认值"的机会。
+    "password": os.getenv("APP_DB_PASS", ""),
     "host": os.getenv("DB_HOST", "localhost"),
     "port": os.getenv("DB_PORT", "5432"),
 }
+
+# `init_db.sql` 里的口令占位符：文件入库、口令不入库，执行前由下面这个函数注入。
+INIT_SQL_PASSWORD_TOKEN = "__APP_DB_PASS__"
+
+
+def render_init_sql(sql_text: str, password: str | None = None) -> str:
+    """把 `init_db.sql` 里的口令占位符换成 `.env` 的 `APP_DB_PASS`。
+
+    为什么需要它：建角色必须带口令，但 `init_db.sql` 是**入库文件**，口令不能写进去。
+    于是文件里只留占位符，真口令在这里从环境变量注入（`.env` 已被 `.gitignore` 挡住）。
+    口令为空 → 直接抛错：宁可起不来，也不要静默建一个空口令 / 占位符口令的角色。
+    """
+    pw = (os.getenv("APP_DB_PASS", "") if password is None else password).strip()
+    if not pw:
+        raise RuntimeError(
+            "APP_DB_PASS 未配置：init_db.sql 里只有口令占位符，请先在 .env 里设置 "
+            "APP_DB_PASS（模板见 .env.example），或 `Copy-Item .env.example .env` 后填写"
+        )
+    return sql_text.replace(INIT_SQL_PASSWORD_TOKEN, pw.replace("'", "''"))
 
 
 # =========================================================
@@ -47,69 +72,102 @@ APP_DB_CONFIG = {
 # 从 hub_pipeline 平移而来，加密方法保持原样：Fernet 对称加密，
 # 同一个 hub_encryption.key 即可解密还原（已实测往返一致，
 # 且能拒绝伪造密文——带 HMAC 认证，不是"无盐裸加密"）。
+#
+# 工作区（界面叫「仓库」）隔离：**每个仓库可以有自己的密钥**（`DSH_KEY_FILE`），
+# 于是 A 仓库的密文在 B 仓库里根本解不开。默认仍是仓库根目录下那把老 key，
+# 所以既有环境的行为逐字节不变。
+# ⚠️ 密钥文件丢失 = 该仓库的密文永久不可解，创建仓库时会提示自行备份。
 # =========================================================
-KEY_FILE = Path(__file__).resolve().parent / "hub_encryption.key"  # ⚠️ 开发期占位，已 gitignore
+KEY_FILE = Path(__file__).resolve().parent / "hub_encryption.key"  # 默认（既有仓库用）
+
+_FERNET_CACHE: dict[str, Fernet] = {}
 
 
-def _load_or_create_key() -> bytes:
-    """读取本地密钥文件；不存在则生成新密钥（开发期占位方案）。"""
-    if KEY_FILE.exists():
-        return KEY_FILE.read_bytes()
+def key_file() -> Path:
+    """当前生效的密钥文件路径（随工作区切换；取不到就退回默认路径）。"""
+    try:
+        from workspace__infra import key_file as _ws_key_file
+
+        return _ws_key_file()
+    except Exception:
+        return KEY_FILE
+
+
+def _load_or_create_key(path: Path | None = None) -> bytes:
+    """读取密钥文件；不存在则生成新密钥（开发期占位方案）。"""
+    path = Path(path or key_file())
+    if path.exists():
+        return path.read_bytes()
     key = Fernet.generate_key()
-    KEY_FILE.write_bytes(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(key)
     print(
-        f"⚠️ 首次运行，已在本地生成加密密钥：{KEY_FILE}\n"
+        f"⚠️ 首次运行，已在本地生成加密密钥：{path}\n"
         f"   这只是开发阶段的占位方案，上线前务必换成从密钥管理服务/环境变量读取，"
-        f"并把 {KEY_FILE.name} 加进 .gitignore，不要和数据库放在一起。"
+        f"并把 {path.name} 加进 .gitignore，不要和数据库放在一起。"
     )
     return key
 
 
-_FERNET = Fernet(_load_or_create_key())
+def _fernet() -> Fernet:
+    """按路径缓存的 Fernet（切换仓库后拿到的就是那个仓库自己的 key）。"""
+    path = key_file()
+    k = str(path)
+    f = _FERNET_CACHE.get(k)
+    if f is None:
+        f = Fernet(_load_or_create_key(path))
+        _FERNET_CACHE[k] = f
+    return f
 
 
 def encrypt_value(value: str) -> str:
     """明文 -> Fernet 密文（ASCII 字符串，可直接存库）。"""
-    return _FERNET.encrypt(value.encode("utf-8")).decode("ascii")
+    return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
 
 
 def decrypt_value(cipher_text: str) -> str:
     """Fernet 密文 -> 明文（同一把 key 才能解，失败会抛 InvalidToken）。"""
-    return _FERNET.decrypt(cipher_text.encode("ascii")).decode("utf-8")
+    return _fernet().decrypt(cipher_text.encode("ascii")).decode("utf-8")
 
 
 # =========================================================
 # 2. 正确的认证与建表流程
 # =========================================================
-def init_db() -> tuple[bool, str]:
-    """使用超级管理员认证，建立数据库、角色并执行 init_db.sql 赋权"""
+def init_db(dbname: str | None = None) -> tuple[bool, str]:
+    """使用超级管理员认证，建立数据库、角色并执行 init_db.sql 赋权。
+
+    `dbname=None` 时取**当前生效仓库**的库名（`.env` 的 APP_DB_NAME，由
+    `workspace__infra.apply_active()` 写入）；这样"切换仓库 → 重启 → 初始化"
+    落在正确的库上，不会再固定死在 `fin_system_db`。
+    """
+    target = (dbname or os.getenv("APP_DB_NAME", "") or "fin_system_db").strip()
     try:
-        # A. 第一步认证：连入系统默认 postgres 库创建 fin_system_db
+        # A. 第一步认证：连入系统默认 postgres 库创建目标库
         conn_admin = psycopg2.connect(**ADMIN_DB_CONFIG)
         conn_admin.autocommit = True
         with conn_admin.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_database WHERE datname = 'fin_system_db';")
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s;", (target,))
             if not cur.fetchone():
-                cur.execute("CREATE DATABASE fin_system_db;")
+                cur.execute(f'CREATE DATABASE "{target}";')
         conn_admin.close()
 
-        # B. 第二步认证：连入 fin_system_db 执行 init_db.sql
+        # B. 第二步认证：连入目标库执行 init_db.sql
         sql_file = Path(__file__).parent / "init_db.sql"
         if not sql_file.exists():
             return False, f"找不到初始化文件: {sql_file.resolve()}"
 
-        sql_script = sql_file.read_text(encoding="utf-8")
+        sql_script = render_init_sql(sql_file.read_text(encoding="utf-8"))
 
         admin_fin_config = ADMIN_DB_CONFIG.copy()
-        admin_fin_config["dbname"] = "fin_system_db"
+        admin_fin_config["dbname"] = target
 
         with psycopg2.connect(**admin_fin_config) as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(sql_script)
 
-        print("✅ 数据库认证、角色创建及 init_db.sql 初始化成功！")
-        return True, "数据库环境与角色创建成功！"
+        print(f"✅ 数据库认证、角色创建及 init_db.sql 初始化成功！（库：{target}）")
+        return True, f"数据库环境与角色创建成功！（库：{target}）"
 
     except Exception as exc:
         err_msg = f"管理员认证或执行 SQL 失败: {exc}"
@@ -460,6 +518,74 @@ def api_save_contract_from_ai(ai_parsed_json: dict, table_name: str = "contract_
         return False, f"存入数据库失败: {exc}"
 
 
+# 发票台账：固定栏目"英文键 -> 中文列名"（唯一键=发票号码）
+_FIXED_INVOICE_KEYS = [
+    ("invoice_no", "发票号码"),
+    ("invoice_code", "发票代码"),
+    ("invoice_date", "开票日期"),
+    ("seller", "销售方"),
+    ("buyer", "购买方"),
+    ("amount", "金额"),
+    ("tax", "税额"),
+    ("total", "价税合计"),
+    ("contract_code", "合同编号"),
+    ("project", "项目"),
+    ("remark", "备注"),
+]
+_COALESCE_INVOICE_COLUMNS = {"项目", "备注"}
+
+
+def api_save_invoice_from_ai(ai_parsed_json: dict, table_name: str = "invoice_ledger") -> tuple[bool, str]:
+    """把一条发票写入发票台账（同发票号码：最新版覆盖）。
+
+    与合同台账同一套"实时读列 + 白名单正则"的写法，字段由**用户审核后**提交
+    （`ledger_inbox__desens.approve`），AI/正则只负责提名与预填。
+    """
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        actual_cols = _get_actual_table_columns(table_name)
+        fixed: dict[str, object] = {}
+        for key, col in _FIXED_INVOICE_KEYS:
+            if col in actual_cols:
+                fixed[col] = ai_parsed_json.get(key)
+        if "发票号码" not in fixed:
+            return False, "发票台账缺少唯一键列【发票号码】，无法写入！"
+        for col in ("金额", "税额", "价税合计"):
+            if col in fixed and fixed[col] in (None, ""):
+                fixed[col] = 0.0
+        extras: dict[str, object] = {}
+        for col, val in (ai_parsed_json.get("extra_fields") or {}).items():
+            if (col in actual_cols and col not in fixed and isinstance(col, str)
+                    and re.match(r"^[\w\u4e00-\u9fa5]+$", col)):
+                extras[col] = val
+        col_names = [f'"{c}"' for c in fixed] + [f'"{c}"' for c in extras]
+        placeholders = ", ".join(["%s"] * len(col_names))
+        update_sets = [
+            f'"{c}" = EXCLUDED."{c}"' for c in fixed if c not in _COALESCE_INVOICE_COLUMNS
+        ] + [
+            f'"{c}" = COALESCE(EXCLUDED."{c}", {table_name}."{c}")'
+            for c in fixed if c in _COALESCE_INVOICE_COLUMNS
+        ] + [f'"{c}" = EXCLUDED."{c}"' for c in extras]
+        sql = (
+            f'INSERT INTO {table_name} ({", ".join(col_names)}) VALUES ({placeholders}) '
+            f'ON CONFLICT ("发票号码") DO UPDATE SET ' + ", ".join(update_sets)
+            + " RETURNING (xmax = 0) AS inserted"
+        )
+        params = [fixed[c] for c in fixed] + [extras[c] for c in extras]
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            inserted = bool(cur.fetchone()[0])
+            conn.commit()
+        no = ai_parsed_json.get("invoice_no")
+        if inserted:
+            return True, f"已新增发票台账行（发票号码：{no}）"
+        return True, f"同发票号码已存在，已按最新版覆盖（发票号码：{no}）"
+    except Exception as exc:
+        return False, f"存入发票台账失败: {exc}"
+
+
 # =========================================================
 # 3. 权限模型（初始版简化实现，后续替换为 RBAC 映射库）
 # =========================================================
@@ -468,12 +594,14 @@ def api_save_contract_from_ai(ai_parsed_json: dict, table_name: str = "contract_
 # 表名必须走白名单，绝不能直接拼进 SQL（防注入）。
 ALLOWED_TABLES: dict[str, str] = {
     "contract_projects": "合同台账",
+    "invoice_ledger": "发票台账",
 }
 
 # 字段权限点定义：读/写分离（financial_role 拥有最高权限）
 FIELD_READ_PERMISSION = "field:read"    # 读取字段（所有已登录用户）
 FIELD_WRITE_PERMISSION = "field:write"  # 调整字段（仅 financial_role / admin）
 LEDGER_STATUS_PERMISSION = "ledger:status"  # 台账状态人工切换（已收款/已开票）
+PROJECT_DECRYPT_PERMISSION = "entity:decrypt:project"  # 项目名称解密（登记=最高管理员自定义加密）
 
 # 角色 -> 权限集合（内存兜底映射）。
 # 说明：role_type 来自 sys_users（默认 finance_staff）；financial_role 为内置
@@ -482,8 +610,10 @@ LEDGER_STATUS_PERMISSION = "ledger:status"  # 台账状态人工切换（已收�
 # 本字典仅在数据库未初始化时兜底。
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "finance_staff": {FIELD_READ_PERMISSION},
-    "financial_role": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION},
-    "admin": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION},
+    "financial_role": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION,
+                       PROJECT_DECRYPT_PERMISSION},
+    "admin": {FIELD_READ_PERMISSION, FIELD_WRITE_PERMISSION, LEDGER_STATUS_PERMISSION,
+              PROJECT_DECRYPT_PERMISSION},
 }
 
 
@@ -988,8 +1118,18 @@ ENTITY_TABLES: dict[str, str] = {
     "date": "entity_mapping_date",
     "id_card": "entity_mapping_id_card",
     "bank_card": "entity_mapping_bank_card",
+    # 新增（按需求）：纳税人识别号 / 开户银行 / 银行账号（含对公账号）
+    "tax_id": "entity_mapping_tax_id",
+    "bank_name": "entity_mapping_bank_name",
+    "bank_account": "entity_mapping_bank_account",
+    # 项目名称（最高管理员自定义加密）：登记即加密，展示值就是编号 PJ####
+    "project": "entity_mapping_project",
+    # 联系电话/手机号（PII）：掩码 + 编号
+    "phone": "entity_mapping_phone",
 }
-SECRET_CATEGORIES = {"id_card", "bank_card"}
+# 敏感类别：只存 sha256 指纹 + Fernet 密文，明文不落盘，解密需 entity:decrypt:<类别> 权限
+SECRET_CATEGORIES = {"id_card", "bank_card", "tax_id", "bank_name", "bank_account", "project",
+                     "phone"}
 
 _CODE_PREFIX = {
     "company": "CO",
@@ -997,18 +1137,109 @@ _CODE_PREFIX = {
     "date": "DT",
     "id_card": "ID",
     "bank_card": "BC",
+    "tax_id": "TX",
+    "bank_name": "BK",
+    "bank_account": "BA",
+    "project": "PJ",
+    "phone": "PH",
 }
 _CATEGORY_BY_PREFIX = {prefix: category for category, prefix in _CODE_PREFIX.items()}
+# 结构校验不通过（不该登记）的明文实体，**照样打码**——只是没有编号。
+# 为什么不能返回原值：那等于"因为是脏数据就漏明文"，hub 里会留下真名/真公司
+# （实测 `签名|李玉丹`、`投标单位|小美`）。待登记项进 audit 日志供管理员补登记。
+_UNREGISTERED_MASK = {
+    "company": "[公司·未登记]",
+    "party": "[人员·未登记]",
+}
 DECRYPT_PERMISSION_BY_CATEGORY = {category: f"entity:decrypt:{category}" for category in ENTITY_TABLES}
 
-# 旧版本地 JSON 映射文件路径（仅用于一次性导入）
+# 已确保存在的映射表（进程内缓存，避免每次调用都建表）
+_ENSURED_ENTITY_TABLES: set[str] = set()
+
+# 旧版本地 JSON 映射文件路径（仅用于一次性导入）。
+# ⚠️ 必须**随工作区 hub 走**：否则新建仓库会把老仓库的真实实体导入进空库，
+#    新仓库的 CO0001 就指到别人家的公司上（编号含义串味）。
 MAPPING_JSON_FILE = Path(__file__).resolve().parent / "hub" / "_mapping" / "entity_mapping.json"
+
+
+def mapping_json_file() -> Path:
+    """当前生效仓库的旧映射 JSON 路径（随 hub 根切换）。"""
+    try:
+        from workspace__infra import mapping_json_file as _ws_mapping
+
+        return _ws_mapping()
+    except Exception:
+        return MAPPING_JSON_FILE
 
 
 def _normalize(value: str) -> str:
     """去空白归一化，作为映射去重比对的 key（严格精确匹配，不做模糊合并——
     避免把两个不同实体误判成同一个）。"""
     return "".join(value.split())
+
+
+def _norm_key(value: str) -> str:
+    """映射表的 `norm_key`（VARCHAR(64)）：短值存归一化明文（沿用旧行为，保证老数据命中），
+    超长值改存 sha256 —— ① 不因超长报错；② 同值仍同键，幂等不变。"""
+    norm = _normalize(value)
+    if len(norm) <= 64:
+        return norm
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _ensure_entity_table(category: str) -> None:
+    """懒建实体映射表（幂等，进程内只做一次）。
+
+    新增类别（tax_id / bank_name / bank_account）无需等 init_db 重跑即可用：
+    首次调用时用管理员连接建表并授权应用角色。明文类别用 real_value 结构，
+    敏感类别用 masked+cipher 结构。
+    """
+    table = ENTITY_TABLES.get(category)
+    if not table or table in _ENSURED_ENTITY_TABLES:
+        return
+    from psycopg2 import sql as _sql
+
+    is_secret = category in SECRET_CATEGORIES
+    cols = ("code VARCHAR(16) UNIQUE NOT NULL, norm_key VARCHAR(64) UNIQUE NOT NULL, "
+            + ("masked VARCHAR(64) NOT NULL, cipher TEXT NOT NULL"
+               if is_secret else "real_value TEXT NOT NULL"))
+    with get_admin_connection() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (id SERIAL PRIMARY KEY, {cols})")
+            cur.execute(
+                _sql.SQL("GRANT ALL PRIVILEGES ON {} TO {}").format(
+                    _sql.Identifier(table), _sql.Identifier(APP_DB_CONFIG["user"])
+                )
+            )
+            cur.execute(
+                _sql.SQL("GRANT USAGE, SELECT ON SEQUENCE {} TO {}").format(
+                    _sql.Identifier(f"{table}_id_seq"), _sql.Identifier(APP_DB_CONFIG["user"])
+                )
+            )
+            # 编号序列表（**跨删除单调**）：编号一旦发出去就不再回收。
+            # 为什么必须：编号历史由 `MAX(id)+1` 生成，删掉登记（管理员清洗脏数据）后
+            # `MAX(id)` 会回落 → 新实体拿到**已被删掉的旧编号**，而历史 hub 正文里
+            # 那个编号还指着老实体（实测：清洗 22 条后 `CO0126` 被复用给了另一家公司，
+            # 未重扫文档里的 `CO0126` 含义就悄悄变了）。
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS entity_code_seq ("
+                "category VARCHAR(32) PRIMARY KEY, last_seq INT NOT NULL DEFAULT 0)"
+            )
+            cur.execute(
+                _sql.SQL("GRANT SELECT, INSERT, UPDATE ON entity_code_seq TO {}").format(
+                    _sql.Identifier(APP_DB_CONFIG["user"])
+                )
+            )
+            cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
+            max_id = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "INSERT INTO entity_code_seq (category, last_seq) VALUES (%s, %s) "
+                "ON CONFLICT (category) DO UPDATE SET last_seq = "
+                "GREATEST(entity_code_seq.last_seq, EXCLUDED.last_seq)",
+                (category, max_id),
+            )
+    _ENSURED_ENTITY_TABLES.add(table)
 
 
 class MappingDbStore:
@@ -1047,15 +1278,40 @@ class MappingDbStore:
         return table
 
     @staticmethod
-    def _next_code(conn, table: str, prefix: str) -> str:
-        """生成下一个编号：CO0001 风格，序号取当前表最大 id + 1。"""
+    def _next_code(conn, table: str, prefix: str, category: str = "") -> str:
+        """生成下一个编号：CO0001 风格。
+
+        ⚠️ 编号必须**跨删除单调**：历史实现只看 `MAX(id)+1`，一旦管理员清洗（删除）
+        掉末尾的登记，`MAX(id)` 回落 → 新实体拿到已被删掉的旧编号，而历史 hub 正文里
+        那个编号还指着老实体（实测清洗后 `CO0126` 被复用给另一家公司，未重扫文档的
+        含义就静默变了）。现在把发号水位记在 `entity_code_seq`，只增不减。
+        """
         with conn.cursor() as cur:
             cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
-            return f"{prefix}{cur.fetchone()[0] + 1:04d}"
+            by_id = int(cur.fetchone()[0] or 0)
+            last = 0
+            if category:
+                cur.execute("SELECT last_seq FROM entity_code_seq WHERE category = %s FOR UPDATE",
+                            (category,))
+                row = cur.fetchone()
+                last = int(row[0]) if row else 0
+            seq = max(by_id, last) + 1
+            if category:
+                cur.execute(
+                    "INSERT INTO entity_code_seq (category, last_seq) VALUES (%s, %s) "
+                    "ON CONFLICT (category) DO UPDATE SET last_seq = EXCLUDED.last_seq",
+                    (category, seq),
+                )
+            return f"{prefix}{seq:04d}"
 
     def _migrate_once(self) -> None:
-        """旧 JSON -> 数据库 一次性导入（幂等：company 表非空即跳过）。"""
-        if not MAPPING_JSON_FILE.exists():
+        """旧 JSON -> 数据库 一次性导入（幂等：company 表非空即跳过）。
+
+        ⚠️ 路径要**实时**取（`mapping_json_file()`，随工作区切换）：早先读模块常量，
+        新建仓库时会把老仓库的 `hub/_mapping/entity_mapping.json` 导进空库。
+        """
+        path = mapping_json_file()
+        if not path.exists():
             return
         try:
             with get_connection() as conn, conn.cursor() as cur:
@@ -1068,9 +1324,43 @@ class MappingDbStore:
 
     # ---------- 对外接口 ----------
     def get_or_create_code(self, category: str, real_value: str) -> str:
-        """明文类别（company/party/date）：按归一化值查重，不存在则插入。"""
+        """明文类别（company/party/date）：按归一化值查重，不存在则插入。
+
+        **登记闸门**（本轮新增）：明文实体先过结构校验（见 entity_repair__desens）。
+        为什么必须拦：`value_valid()` 对 company/party 原先只要求"含中文"，于是
+        "株 / 20 年 月 日 / 项目付款进度 / ¥789814.72 元 / 申请人" 这些**标签、计量单位、
+        金额串**都被登记成 CO####，全库编号语义被污染（实测 15+ 条）。
+
+        ⚠️ 拒收**不等于放行明文**（本轮修复）：早先校验不通过时直接返回原值，
+        等于"因为长得不像公司名，就把一个真名/真公司原样留在 hub 里"
+        （实测 OCR 签到表里 `签名|李玉丹`、`投标单位|小美` 整列明文进 hub）。
+        现在：company/party 被拒时返回**未登记占位码**（`[公司·未登记]`），
+        同时把待登记项写进 `logs/desens_repair/rejected_<date>.jsonl` 供管理员补登记；
+        date 类被拒时保留原值（日期本身不是身份信息，且取数要用）。
+        """
+        try:
+            import entity_repair__desens as _repair
+
+            ok, why = _repair.value_acceptable(category, real_value)
+            if not ok:
+                print(f"[脱敏登记·拒收] {category} {real_value!r} → {why}", flush=True)
+                _repair.audit({"action": "reject", "category": category,
+                               "value": real_value, "why": why})
+                return _UNREGISTERED_MASK.get(category, real_value)
+        except Exception:
+            pass
+        try:
+            import entity_repair__desens as _repair
+
+            ok, why = _repair.value_acceptable(category, real_value)
+            if not ok:
+                print(f"[脱敏登记·拒收] {category} {real_value!r} → {why}", flush=True)
+                return real_value
+        except Exception:
+            pass
+        _ensure_entity_table(category)
         table = self._table(category)
-        norm_key = _normalize(real_value)
+        norm_key = _norm_key(real_value)
         prefix = _CODE_PREFIX.get(category, "EN")
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -1078,7 +1368,7 @@ class MappingDbStore:
                 row = cur.fetchone()
                 if row:
                     return row[0]
-                code = self._next_code(conn, table, prefix)
+                code = self._next_code(conn, table, prefix, category)
                 cur.execute(
                     f"INSERT INTO {table} (code, norm_key, real_value) VALUES (%s, %s, %s)",
                     (code, norm_key, real_value),
@@ -1086,8 +1376,15 @@ class MappingDbStore:
                 conn.commit()
                 return code
 
-    def get_or_create_secret_code(self, category: str, real_value: str, masked_display: str) -> str:
-        """敏感类别（id_card/bank_card）：只存指纹+密文，明文不落盘。"""
+    def get_or_create_secret_code(
+        self, category: str, real_value: str, masked_display: str | None = None
+    ) -> str:
+        """敏感类别（id_card/bank_card/tax_id/bank_name/bank_account/project）：
+        只存指纹+密文，明文不落盘。
+
+        masked_display=None 表示"展示值就是编号本身"（项目名称用：名称一个字都不显示）。
+        """
+        _ensure_entity_table(category)
         table = self._table(category)
         norm_key = _normalize(real_value)
         fingerprint = hashlib.sha256(norm_key.encode("utf-8")).hexdigest()
@@ -1098,13 +1395,18 @@ class MappingDbStore:
                 row = cur.fetchone()
                 if row:
                     return row[0]
-                code = self._next_code(conn, table, prefix)
+                code = self._next_code(conn, table, prefix, category)
                 cur.execute(
                     f"INSERT INTO {table} (code, norm_key, masked, cipher) VALUES (%s, %s, %s, %s)",
-                    (code, fingerprint, masked_display, encrypt_value(real_value)),
+                    (code, fingerprint, masked_display if masked_display is not None else code,
+                     encrypt_value(real_value)),
                 )
                 conn.commit()
                 return code
+
+    def get_or_create_project_code(self, real_value: str) -> str:
+        """项目名称 -> 编号（PJ####）：同值同码；展示值即编号（不显示名称片段）。"""
+        return self.get_or_create_secret_code("project", real_value, None)
 
     def lookup_real_value(self, code: str) -> str | None:
         """按编码反查真实值（仅明文类别）；敏感类别请走 decrypt()。"""
@@ -1161,9 +1463,10 @@ def import_entity_mapping_json() -> tuple[int, str]:
 
     返回 (新增条数, 说明)。幂等：已存在的归一化键自动跳过。
     """
-    if not MAPPING_JSON_FILE.exists():
+    path = mapping_json_file()
+    if not path.exists():
         return 0, "未找到 entity_mapping.json，跳过导入"
-    data = json.loads(MAPPING_JSON_FILE.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
     store = MappingDbStore()
     count = 0
     for category, bucket in data.items():
@@ -1237,7 +1540,89 @@ def api_set_contract_status(
 ) -> tuple[bool, str]:
     """人工切换台账状态：是否已收款 / 是否已开票（默认未，可手动改为已）。
 
-    权限：ledger:status（financial_role / admin）。
+    权限：ledger:status（financial_role / admin）。保留本函数以兼容既有调用方，
+    实际逻辑走通用版 `api_set_ledger_status`（按表的"显示/状态列"配置）。
+    """
+    return api_set_ledger_status(user, table_name, contract_code, paid=paid,
+                                 invoiced=invoiced)
+
+
+# =========================================================
+# 「台账一览 / 状态」按表配置（切换业务表时界面字段跟着换）
+# ---------------------------------------------------------
+# 为什么需要：主窗口的"业务表"下拉可以在合同台账 / 发票台账之间切换，但状态窗口原来
+# 写死合同那 5 列（合同编号/项目/合同金额/已收款/已开票），切到发票台账就会去查
+# 发票台账里**不存在**的列 → 读取失败。这里把"每张台账看哪几列、有没有状态列"
+# 做成配置，界面据此渲染；配置里的列都会与实际物理列求交集（用户删过列也不会炸）。
+LEDGER_VIEW: dict[str, dict] = {
+    "contract_projects": {
+        "key": "合同编号",
+        "columns": ["合同编号", "项目", "合同金额", "是否已收款", "是否已开票"],
+        "status": [("是否已收款", "已收款"), ("是否已开票", "已开票")],
+    },
+    "invoice_ledger": {
+        "key": "发票号码",
+        "columns": ["发票号码", "开票日期", "销售方", "购买方", "金额", "税额",
+                    "价税合计", "合同编号", "项目"],
+        # 发票台账没有"已收款/已开票"两列：这两个状态记在合同台账上，
+        # 所以这里为空 → 界面只读展示，不显示勾选框、不显示"保存状态"。
+        "status": [],
+    },
+}
+
+
+def api_ledger_view(user: dict | None, table_name: str = "contract_projects", *,
+                    limit: int = 500, search: str = "") -> tuple[bool, dict | str]:
+    """按表的配置返回"一览列 + 状态列 + 数据行"（状态窗口用；切换台账时字段随之改变）。
+
+    权限：field:read（所有已登录用户）——与既有 `api_list_contracts` 同一口径，
+    只多给"发票台账自己的列"，不额外扩大合同台账的展示范围。
+    """
+    ok, msg = require_permission(user, FIELD_READ_PERMISSION)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    cfg = LEDGER_VIEW.get(table_name) or {"key": "", "columns": [], "status": []}
+    try:
+        actual = _get_actual_table_columns(table_name)
+        cols = [c for c in cfg["columns"] if c in actual]
+        status = [(c, label) for c, label in cfg["status"] if c in actual]
+        key_col = cfg["key"] if cfg["key"] in actual else (cols[0] if cols else "id")
+    except Exception as exc:
+        return False, f"读取台账结构失败: {exc}"
+    if not cols:
+        return False, f"「{ALLOWED_TABLES.get(table_name, table_name)}」里没有可展示的列"
+    try:
+        where, params = "", []
+        if search.strip():
+            like = " OR ".join([f'"{c}"::text ILIKE %s' for c in cols])
+            where = f" WHERE ({like})"
+            params = [f"%{search.strip()}%"] * len(cols)
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"SELECT COUNT(*) AS n FROM {table_name}" + where, tuple(params))
+            total = int((cur.fetchone() or {}).get("n") or 0)
+            cur.execute(
+                f'SELECT "id", ' + ", ".join(f'"{c}"' for c in cols) + f" FROM {table_name}"
+                + where + ' ORDER BY "id" DESC LIMIT %s',
+                tuple(params + [max(1, min(int(limit), 5000))]))
+            rows = [{k: _jsonable(v) for k, v in dict(r).items()} for r in cur.fetchall()]
+        return True, {"table": table_name, "display": ALLOWED_TABLES.get(table_name, table_name),
+                      "key_column": key_col, "columns": cols,
+                      "status_columns": [{"name": c, "label": lb} for c, lb in status],
+                      "rows": rows, "total": total}
+    except Exception as exc:
+        return False, f"读取台账失败: {exc}"
+
+
+def api_set_ledger_status(user: dict | None, table_name: str, key_value: str, *,
+                          paid: bool | None = None,
+                          invoiced: bool | None = None) -> tuple[bool, str]:
+    """通用版状态切换：按表的配置把"已收款/已开票"写到对应列（发票台账没有这两列 → 明确拒绝）。
+
+    权限：ledger:status（financial_role / admin）。定位列用配置里的 key（合同编号/发票号码），
+    该列必须实际存在。
     """
     ok, msg = require_permission(user, LEDGER_STATUS_PERMISSION)
     if not ok:
@@ -1245,26 +1630,317 @@ def api_set_contract_status(
     bad = _check_table_allowed(table_name)
     if bad:
         return False, bad
-    if paid is None and invoiced is None:
-        return False, "未指定要修改的状态！"
     try:
+        actual = _get_actual_table_columns(table_name)
+        cfg = LEDGER_VIEW.get(table_name) or {"key": "", "status": []}
+        key_col = cfg["key"] if cfg["key"] in actual else ""
+        if not key_col:
+            return False, f"「{ALLOWED_TABLES.get(table_name, table_name)}」没有可用的定位列"
+        pairs = [("是否已收款", paid), ("是否已开票", invoiced)]
+        pairs = [(c, v) for c, v in pairs if v is not None]
+        if not pairs:
+            return False, "未指定要修改的状态！"
+        missing = [c for c, _v in pairs if c not in actual]
+        if missing:
+            return False, (f"「{ALLOWED_TABLES.get(table_name, table_name)}」里没有列"
+                           f"{missing}——这两个状态记在**合同台账**上，请在合同台账里改。")
         sets, params = [], []
-        if paid is not None:
-            sets.append(f'"是否已收款" = %s')
-            params.append(bool(paid))
-        if invoiced is not None:
-            sets.append(f'"是否已开票" = %s')
-            params.append(bool(invoiced))
-        params.append(contract_code)
+        for col, val in pairs:
+            sets.append(f'"{col}" = %s')
+            params.append(bool(val))
+        params.append(key_value)
         with get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                f'UPDATE {table_name} SET ' + ", ".join(sets) + ' WHERE "合同编号" = %s',
-                params,
-            )
+            cur.execute(f'UPDATE {table_name} SET ' + ", ".join(sets)
+                        + f' WHERE "{key_col}" = %s', params)
             conn.commit()
-            return cur.rowcount > 0, "台账状态已更新！" if cur.rowcount else "未找到该合同编号！"
+            if cur.rowcount:
+                _ledger_audit({"event": "set_status", "table": table_name, "key": key_value,
+                               "changes": {c: v for c, v in pairs},
+                               "by": (user or {}).get("username")})
+                return True, "台账状态已更新！"
+            return False, f"未找到该{key_col}！"
     except Exception as exc:
         return False, f"更新台账状态失败: {exc}"
+
+
+# =========================================================
+# 4.8 台账「全字段」管理 + 导出（**仅最高管理员**）
+# ---------------------------------------------------------
+# 需求：① 一个窗口里能看到台账**完整字段**并人工修改；② 台账可导出成表格文件存到指定位置。
+# 与既有 `api_set_contract_status`（只切"已收款/已开票"，ledger:status）的区别：
+#   · 这里能读写**任意列**（含 id/创建时间在内的全字段），所以门槛收到 role_type == 'admin'；
+#   · 每次改动都写审计（旧值→新值、操作人、时间），可追溯；
+#   · 列名必须命中 information_schema 实际列，id/创建时间不可改（防把主键改坏）。
+# =========================================================
+LEDGER_ADMIN_LOG_DIR = Path(__file__).resolve().parent / "logs" / "ledger_admin"
+
+
+def _require_admin(user: dict | None) -> tuple[bool, str]:
+    """台账全字段读写/导出：**只允许最高管理员**（在服务端强制，UI 禁用只是明面上的）。"""
+    if not user:
+        return False, "未登录，无法执行该操作！"
+    if user.get("role_type") != "admin":
+        return False, (f"该操作仅限最高管理员（当前角色："
+                       f"{user.get('role_type') or '未知'}）；如需修改台账字段请联系最高管理员。")
+    return True, ""
+
+
+def _ledger_audit(rec: dict) -> None:
+    """台账改动审计（本地 jsonl；值截断到 60 字，避免日志被长文本撑爆）。"""
+    try:
+        import json as _json
+        import time as _time
+
+        LEDGER_ADMIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": _time.strftime("%Y-%m-%d %H:%M:%S"), **rec}
+        for k in ("old", "new"):
+            if isinstance(rec.get(k), str) and len(rec[k]) > 60:
+                rec[k] = rec[k][:60] + f"…(共{len(rec[k])}字)"
+        with (LEDGER_ADMIN_LOG_DIR / f"audit_{_time.strftime('%Y%m%d')}.jsonl").open(
+                "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _jsonable(v):
+    """数据库值 → 可 JSON 序列化的形式（Decimal/日期/时间都转掉，界面与日志才能直接用）。"""
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return float(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat(sep=" ", timespec="seconds")
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return bytes(v).decode("utf-8", "replace")
+    return v
+
+
+def _ledger_columns(table_name: str) -> list[dict]:
+    """表的实际列（顺序按 ordinal_position），含类型/是否可空/是否主键。"""
+    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT c.column_name, c.data_type, c.is_nullable, c.ordinal_position,
+                   COALESCE(pk.is_pk, FALSE) AS is_pk
+            FROM information_schema.columns c
+            LEFT JOIN (
+                SELECT kcu.column_name, TRUE AS is_pk
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                WHERE tc.table_name = %s AND tc.constraint_type = 'PRIMARY KEY'
+            ) pk ON pk.column_name = c.column_name
+            WHERE c.table_schema = 'public' AND c.table_name = %s
+            ORDER BY c.ordinal_position""", (table_name, table_name))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def api_ledger_schema(user: dict | None,
+                      table_name: str = "contract_projects") -> tuple[bool, dict | str]:
+    """台账结构（窗口用来决定显示哪些列、哪些列只读）。权限：最高管理员。"""
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        cols = _ledger_columns(table_name)
+        m = _catalog_by_col(table_name)
+        for c in cols:
+            meta = m.get(c["column_name"]) or {}
+            c["logical_key"] = meta.get("logical_key") or ""
+            c["is_key_col"] = bool(meta.get("is_key_col"))
+        return True, {"table": table_name, "display": ALLOWED_TABLES.get(table_name, table_name),
+                      "columns": cols}
+    except Exception as exc:
+        return False, f"读取台账结构失败: {exc}"
+
+
+def api_ledger_rows(user: dict | None, table_name: str = "contract_projects", *,
+                    limit: int = 200, offset: int = 0,
+                    search: str = "") -> tuple[bool, dict | str]:
+    """读取台账**完整字段**的数据行（窗口用）。权限：最高管理员。
+
+    search：对**所有文本列**做 ILIKE 模糊匹配（找某合同号/某公司/某金额）。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        cols = _ledger_columns(table_name)
+        names = [c["column_name"] for c in cols]
+        where, params = "", []
+        if search.strip():
+            text_cols = [c["column_name"] for c in cols if c["data_type"] in
+                         ("character varying", "text", "character", "numeric", "integer",
+                          "bigint", "date", "timestamp without time zone")]
+            like = " OR ".join([f'"{c}"::text ILIKE %s' for c in text_cols] or ["FALSE"])
+            where = f" WHERE ({like})"
+            params = [f"%{search.strip()}%"] * len(text_cols)
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"SELECT COUNT(*) AS n FROM {table_name}" + where, tuple(params))
+            total = int((cur.fetchone() or {}).get("n") or 0)
+            cur.execute(
+                f'SELECT * FROM {table_name}' + where + ' ORDER BY "id" DESC LIMIT %s OFFSET %s',
+                tuple(params + [max(1, min(int(limit), 5000)), max(0, int(offset))]))
+            rows = [{k: _jsonable(v) for k, v in dict(r).items()} for r in cur.fetchall()]
+        return True, {"table": table_name, "columns": names, "column_meta": cols,
+                      "rows": rows, "total": total, "offset": offset, "limit": limit}
+    except Exception as exc:
+        return False, f"读取台账数据失败: {exc}"
+
+
+def _coerce_cell(col_meta: dict, value):
+    """把界面/CSV 来的字符串按列类型转换；转不了就抛 ValueError。"""
+    dtype = col_meta.get("data_type") or "text"
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if (col_meta.get("is_nullable") or "YES") == "NO":
+            raise ValueError(f"列「{col_meta['column_name']}」不允许为空")
+        return None
+    s = value.strip() if isinstance(value, str) else value
+    if dtype in ("numeric", "double precision", "real"):
+        try:
+            return float(str(s).replace(",", "").replace("¥", "").replace("￥", ""))
+        except Exception as exc:
+            raise ValueError(f"「{s}」不是数字") from exc
+    if dtype in ("integer", "bigint", "smallint"):
+        try:
+            return int(float(str(s).replace(",", "")))
+        except Exception as exc:
+            raise ValueError(f"「{s}」不是整数") from exc
+    if dtype == "boolean":
+        t = str(s).strip().lower()
+        if t in ("1", "true", "t", "y", "yes", "是", "已", "√", "对"):
+            return True
+        if t in ("0", "false", "f", "n", "no", "否", "未", "×"):
+            return False
+        raise ValueError(f"「{s}」不是布尔值（可填 是/否、已/未、1/0）")
+    if dtype.startswith("timestamp"):
+        raise ValueError("时间列不允许手工修改")
+    return str(s)
+
+
+def api_ledger_update_cell(user: dict | None, table_name: str, row_id: int, column: str,
+                           value) -> tuple[bool, str]:
+    """人工修改台账里的**一个单元格**（按主键 id 定位）。权限：最高管理员。
+
+    为什么按 id 定位：合同编号/发票号码本身是**可编辑列**，拿它当定位键会在改号时错行。
+    审计：每次改动写 logs/ledger_admin/audit_<日期>.jsonl（旧值→新值 + 操作人）。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    try:
+        cols = {c["column_name"]: c for c in _ledger_columns(table_name)}
+        col = str(column or "")
+        if col not in cols:
+            return False, f"表里没有列「{col}」"
+        if col in ("id", "创建时间"):
+            return False, f"列「{col}」是系统列，不允许手工修改"
+        col_meta = cols[col]
+        try:
+            new_val = _coerce_cell(col_meta, value)
+        except ValueError as exc:
+            return False, str(exc)
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f'SELECT "{col}" AS old FROM {table_name} WHERE "id" = %s',
+                        (int(row_id),))
+            row = cur.fetchone()
+            if row is None:
+                return False, f"没有 id={row_id} 这一行"
+            old_val = row["old"]
+            cur.execute(
+                f'UPDATE {table_name} SET "{col}" = %s WHERE "id" = %s',
+                (new_val, int(row_id)))
+            conn.commit()
+        _ledger_audit({"event": "update_cell", "table": table_name, "id": int(row_id),
+                       "column": col, "old": old_val, "new": new_val,
+                       "by": (user or {}).get("username")})
+        return True, f"已更新 {table_name}.id={row_id} 的「{col}」"
+    except Exception as exc:
+        return False, f"更新台账字段失败: {exc}"
+
+
+def api_ledger_export(user: dict | None, table_name: str, out_path: str, *,
+                      fmt: str = "xlsx", limit: int = 0) -> tuple[bool, str]:
+    """把台账导出成表格文件（xlsx / csv）到**指定位置**。权限：最高管理员。
+
+    · xlsx：openpyxl 写，表头用台账的中文列名，首行冻结、列宽自适应；
+    · csv：utf-8-sig（Excel 直接双击不乱码）；
+    · limit>0 时限行数（导出前想先看一眼时用）。
+    返回消息里带绝对路径与行数。
+    """
+    ok, msg = _require_admin(user)
+    if not ok:
+        return False, msg
+    bad = _check_table_allowed(table_name)
+    if bad:
+        return False, bad
+    fmt = (fmt or "xlsx").lower().lstrip(".")
+    if fmt not in ("xlsx", "csv"):
+        return False, f"不支持的导出格式：{fmt}（仅支持 xlsx / csv）"
+    path = Path(str(out_path or "")).expanduser()
+    if not path.name:
+        return False, "导出路径为空"
+    if path.suffix.lower() != f".{fmt}":
+        path = path.with_suffix(f".{fmt}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            sql = f'SELECT * FROM {table_name} ORDER BY "id"'
+            if limit and int(limit) > 0:
+                sql += f" LIMIT {int(limit)}"
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT * FROM information_schema.columns WHERE table_schema='public' "
+                        "AND table_name=%s ORDER BY ordinal_position", (table_name,))
+            cols = [r["column_name"] for r in cur.fetchall()]
+        if fmt == "xlsx":
+            from openpyxl import Workbook
+            from openpyxl.utils import get_column_letter
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = ALLOWED_TABLES.get(table_name, table_name)[:31] or "台账"
+            ws.append(cols)
+            for r in rows:
+                ws.append([("" if r.get(c) is None else
+                            (r[c].isoformat(sep=" ", timespec="seconds")
+                             if hasattr(r[c], "isoformat") else r[c])) for c in cols])
+            for i, c in enumerate(cols, start=1):
+                width = max(len(str(c)) * 2, 10)
+                for r in rows[:200]:
+                    v = r.get(c)
+                    if v is None:
+                        continue
+                    width = max(width, min(len(str(v)) + 2, 60))
+                ws.column_dimensions[get_column_letter(i)].width = width
+            ws.freeze_panes = "A2"
+            wb.save(str(path))
+        else:
+            import csv as _csv
+
+            with path.open("w", encoding="utf-8-sig", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow(cols)
+                for r in rows:
+                    w.writerow(["" if r.get(c) is None else
+                                (r[c].isoformat(sep=" ", timespec="seconds")
+                                 if hasattr(r[c], "isoformat") else r[c]) for c in cols])
+        _ledger_audit({"event": "export", "table": table_name, "fmt": fmt,
+                       "rows": len(rows), "path": str(path.resolve()),
+                       "by": (user or {}).get("username")})
+        return True, (f"已导出 {len(rows)} 行到：{path.resolve()}\n"
+                      f"（格式 {fmt}，表头为台账列名）")
+    except Exception as exc:
+        return False, f"导出失败: {type(exc).__name__}: {exc}"
 
 
 def api_save_feature_hashes(

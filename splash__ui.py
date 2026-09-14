@@ -1,10 +1,10 @@
 """启动画面模块：OCR 模型预加载期间的加载窗口（蓝色横线进度条）。
 
-文件位置：项目根目录新增 splash.py（单个文件即可，暂不需要独立文件夹）。
+文件位置：项目根目录新增 splash__ui.py（单个文件即可，暂不需要独立文件夹）。
 职责单一：只负责"程序启动期"的 UI 与后台任务——
   - SplashWindow    ：无边框置顶窗口，蓝色不确定进度条 + 阶段文字
   - StartupThread   ：后台线程，按阶段执行【数据库初始化 -> GPU/显存检测 -> OCR 模型预加载】
-table.py 的 main() 在登录弹窗前使用二者，把"首次加载模型"的耗时
+table__ui.py 的 main() 在登录弹窗前使用二者，把"首次加载模型"的耗时
 从「拖入文件那一刻」转移到启动阶段，拖拽不再卡顿。
 """
 
@@ -19,10 +19,10 @@ class SplashWindow(QWidget):
 
     用法：
         splash = SplashWindow()
-        splash.show()
-        splash.set_stage("正在加载 OCR 模型…")
+        splash__ui.show()
+        splash__ui.set_stage("正在加载 OCR 模型…")
         ...（工作完成后）
-        splash.close()
+        splash__ui.close()
     """
 
     def __init__(self) -> None:
@@ -85,7 +85,7 @@ class StartupThread(QThread):
     def run(self) -> None:
         # 1. 数据库初始化（结果必发；失败由 main() 决定是否中止）
         self.stage_changed.emit("初始化数据库…")
-        from database_serv import init_db
+        from database_serv__infra import init_db
 
         db_ok, db_msg = init_db()
         self.init_db_result.emit(db_ok, db_msg)
@@ -94,7 +94,7 @@ class StartupThread(QThread):
         # 注意：warmup_ocr 内部已做设备探测+模型加载（get_ocr 解析一次并记录），
         # 这里不再单独调用 resolve_ocr_device()，避免启动路径重复探测/重复打印。
         try:
-            from scanner_core import warmup_ocr
+            from scanner_core__scan import warmup_ocr
 
             self.stage_changed.emit("检测 GPU / 显存并加载 OCR 模型…")
             result = warmup_ocr()
